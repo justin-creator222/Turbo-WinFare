@@ -21,7 +21,9 @@ import argparse
 import io
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -57,6 +59,24 @@ def _latest_release_asset(repo, predicate):
     raise RuntimeError(f"No matching asset in latest release of {repo}")
 
 
+def _w64devkit_asset(name):
+    """Picks the x64 build out of a release's asset list.
+
+    w64devkit stopped publishing .zip assets after v1.23.0: v2.0.0 and v2.1.0 ship a
+    plain self-extracting .exe, and v2.2.0 onward ship <name>.7z.exe. Matching only
+    ".zip" therefore selected nothing and every fresh install died with "No matching
+    asset in latest release". That went unnoticed for a long time because this
+    function returns early whenever C:\\w64devkit already exists -- it only ever
+    failed on a clean machine, which is exactly where CI runs.
+    """
+    n = name.lower()
+    if n.endswith(".sig"):          # detached signatures, not archives
+        return False
+    if not n.startswith("w64devkit-x64-"):
+        return False                # skip x86, source.tar, and fortran variants
+    return n.endswith(".exe") or n.endswith(".zip")
+
+
 def install_w64devkit(force=False):
     gxx = W64DEVKIT_DIR / "bin" / "g++.exe"
     if gxx.exists() and not force:
@@ -64,18 +84,50 @@ def install_w64devkit(force=False):
         return
 
     print("[w64devkit] resolving latest release...")
-    name, url = _latest_release_asset("skeeto/w64devkit", lambda n: n.endswith(".zip"))
+    name, url = _latest_release_asset("skeeto/w64devkit", _w64devkit_asset)
     print(f"[w64devkit] {name}")
     blob = _download(url)
 
+    # Both archive kinds contain a single top-level w64devkit/ directory, so they
+    # extract into the parent of W64DEVKIT_DIR.
+    parent = W64DEVKIT_DIR.parent
     print(f"[w64devkit] extracting to {W64DEVKIT_DIR}...")
-    with zipfile.ZipFile(io.BytesIO(blob)) as zf:
-        # The archive contains a top-level w64devkit/ directory.
-        zf.extractall(W64DEVKIT_DIR.parent)
+
+    if name.lower().endswith(".zip"):
+        with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+            zf.extractall(parent)
+    else:
+        installer = Path(tempfile.gettempdir()) / name
+        installer.write_bytes(blob)
+        try:
+            # 7-Zip self-extractor: -y assumes yes, -o sets the output directory.
+            #
+            # The return code is deliberately ignored. This SFX exits 2 even on a
+            # complete and perfectly working extraction, and prints nothing at all
+            # to stdout or stderr, so the exit status carries no signal. Success is
+            # decided below by whether g++.exe actually landed and runs.
+            subprocess.run([str(installer), "-y", f"-o{parent}"],
+                           check=False,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+        finally:
+            installer.unlink(missing_ok=True)
 
     if not gxx.exists():
-        raise RuntimeError(f"Extraction finished but {gxx} is missing")
-    print(f"[w64devkit] OK -> {gxx}")
+        raise RuntimeError(
+            f"Extraction finished but {gxx} is missing.\n"
+            f"    If {parent} is not writable by this account, re-run from an\n"
+            f"    elevated shell, or extract {name} by hand so that {gxx} exists."
+        )
+
+    # Verify it actually runs -- an extracted-but-broken toolchain otherwise only
+    # shows up much later, as a confusing CMake compiler-check failure.
+    probe = subprocess.run([str(gxx), "--version"], capture_output=True, text=True)
+    if probe.returncode != 0:
+        raise RuntimeError(f"{gxx} exists but failed to run:\n{probe.stderr.strip()}")
+    version = probe.stdout.splitlines()[0] if probe.stdout else "unknown version"
+
+    print(f"[w64devkit] OK -> {gxx} ({version})")
     print("           NOTE: add C:\\w64devkit\\bin to PATH, or g++ cannot find 'as'.")
 
 
