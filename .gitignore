@@ -1,0 +1,41 @@
+# Model bundles and weights -- never redistribute. See NOTICE and
+# THIRD_PARTY_NOTICES.md: weights are downloaded at run time from the pinned
+# Hugging Face checkpoint and remain governed by their source terms.
+*.gturbo/
+*.gturbo.placeholder-OLD/
+*.bin
+*.safetensors
+*.gguf
+
+# Upstream Swift/Metal reference checkout. Not vendored here -- clone
+# https://github.com/drumih/turbo-fieldfare separately if you want to diff.
+turbo-fieldfare-main/
+
+# Internal working notes, superseded by docs/. They describe pre-Stage-0
+# behaviour and embed local absolute paths.
+#
+# Anchored to the repo root on purpose. An unanchored `Performance.md` would
+# also match docs/PERFORMANCE.md, since Windows checkouts are case-insensitive.
+/weights.md
+/Performance.md
+/spec.md
+
+# Build output and toolchain
+build/
+*.dll
+*.exe
+*.a
+*.lib
+*.obj
+*.pdb
+*.zip
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local scratch
+*.log
+scratch/
+tmp/

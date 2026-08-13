@@ -1,0 +1,17 @@
+blank_issues_enabled: false
+contact_links:
+  - name: macOS / Metal implementation (upstream)
+    url: https://github.com/drumih/turbo-fieldfare
+    about: >
+      Turbo-WinFare is an independent Windows port. Questions and bugs about the original
+      Swift/Metal implementation belong upstream — please do not report Windows, Direct3D, or
+      MinGW build problems there.
+  - name: Gemma 4 model behaviour
+    url: https://huggingface.co/mlx-community/gemma-4-26b-a4b-it-4bit
+    about: >
+      Hallucination, refusals, and answer quality are properties of the model, not of this
+      engine. Only report them here if this engine's output differs from the reference
+      implementation's on the same prompt with greedy decoding.
+  - name: Security vulnerability
+    url: https://github.com/justin-creator222/Turbo-WinFare/security/advisories/new
+    about: Please report security issues privately, not as a public issue. See SECURITY.md.

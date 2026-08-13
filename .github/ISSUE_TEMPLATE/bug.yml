@@ -1,0 +1,87 @@
+name: Bug report
+description: Something in Turbo-WinFare is broken on Windows
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Turbo-WinFare is an independent Windows port of
+        [TurboFieldfare](https://github.com/drumih/turbo-fieldfare).** Windows, Direct3D,
+        driver, and build problems belong here — please do not report them upstream.
+
+        Before filing: model weights are not distributed with this repository, so "no such
+        file" errors usually mean `python tools/convert_hf_to_gturbo.py` has not been run.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What did you expect, and what happened instead? Paste the full error output.
+    validations:
+      required: true
+
+  - type: input
+    id: command
+    attributes:
+      label: Exact command line
+      description: The full command, including every flag.
+      placeholder: .\build\turbo-winfare.exe --prompt "What is the capital of France?" --max-tokens 12
+    validations:
+      required: true
+
+  - type: dropdown
+    id: cpu-repro
+    attributes:
+      label: Does it reproduce with --cpu?
+      description: >
+        Adding `--cpu` runs the scalar FP32 reference path, which touches no D3D12 and compiles
+        no shaders. This is the fastest way to split a GPU/driver bug from an engine bug — please
+        try it before filing.
+      options:
+        - "Yes — it also fails with --cpu"
+        - "No — --cpu works, only the GPU path fails"
+        - "Not applicable (build failure, or the app never starts)"
+        - "I did not try"
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver version
+      description: >
+        e.g. "Radeon 780M, Adrenalin 25.3.1". Find the driver version in Device Manager →
+        Display adapters → Properties → Driver.
+    validations:
+      required: true
+
+  - type: input
+    id: system
+    attributes:
+      label: Windows build and RAM
+      description: 'Run `winver` for the build number. e.g. "Windows 11 26200, 16 GB"'
+    validations:
+      required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: Output of `git rev-parse --short HEAD`.
+    validations:
+      required: true
+
+  - type: textarea
+    id: tests
+    attributes:
+      label: Test results
+      description: >
+        Output of `ctest --test-dir build --output-on-failure`, and of
+        `.\build\test_gpu_kernels.exe` if this looks like a wrong-output or GPU problem.
+      render: text
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Storage type (NVMe / SATA / HDD), non-default `--slots` or `--context`, etc.

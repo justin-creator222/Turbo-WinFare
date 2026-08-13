@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build and test (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Ninja
+        run: choco install ninja --no-progress -y
+
+      - name: Fetch toolchain (w64devkit + DXC)
+        run: python tools/download_toolchain.py
+        # Resolves the latest w64devkit and DirectXShaderCompiler releases through the
+        # unauthenticated GitHub API. If this step starts failing with 403, it is rate
+        # limiting on the runner's IP, not a code problem.
+
+      - name: Configure
+        run: |
+          $env:PATH = "C:\w64devkit\bin;" + $env:PATH
+          cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=C:/w64devkit/bin/g++.exe
+
+      - name: Build
+        run: |
+          $env:PATH = "C:\w64devkit\bin;" + $env:PATH
+          cmake --build build --config Release
+
+      - name: Test
+        # test_gpu_kernels is excluded deliberately: it creates a real D3D12 device and
+        # compiles SM 6.6 shaders, and GitHub's hosted runners have no GPU capable of that.
+        # It would fail permanently here. Contributors must run it locally -- see
+        # CONTRIBUTING.md, "The correctness gate".
+        #
+        # Everything else runs without a GPU and without model weights.
+        run: |
+          $env:PATH = "C:\w64devkit\bin;" + $env:PATH
+          ctest --test-dir build --output-on-failure -E test_gpu_kernels
+
+      - name: Check --help still works
+        run: .\build\turbo-winfare.exe --help

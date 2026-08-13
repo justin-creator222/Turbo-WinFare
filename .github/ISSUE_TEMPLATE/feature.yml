@@ -1,0 +1,48 @@
+name: Feature request
+description: Suggest a capability for the Windows port
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Turbo-WinFare is an independent Windows port of
+        [TurboFieldfare](https://github.com/drumih/turbo-fieldfare).** Requests for the
+        macOS/Metal implementation belong upstream, not here.
+
+        Several known gaps are already tracked in the README's parity table — thought-channel
+        suppression, tool calling, prompt-cache/KV reuse across turns, chunked prefill, FP16 KV,
+        and context above 4096. Please check it before filing.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the situation you are actually in, not just the feature you want.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like it to do?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: parity
+    attributes:
+      label: Does the reference implementation already do this?
+      description: >
+        Parity with TurboFieldfare is a design goal, so "upstream has it" is a strong argument.
+      options:
+        - "Yes — upstream has it"
+        - "No — this would be new"
+        - "I don't know"
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Links, prior art, or a sketch of how you would implement it.

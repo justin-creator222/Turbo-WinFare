@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Turbo-WinFare | Native AMD Legion Go S Inference Engine</title>
+    <link rel="stylesheet" href="styles.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div id="app">
+        <!-- Top Header & Hardware HUD -->
+        <header>
+            <div class="brand">
+                <div class="brand-icon">⚡</div>
+                <div class="brand-title">
+                    <h1>TURBO-WINFARE</h1>
+                    <span>Lenovo Legion Go S • DirectX 12 MoE Engine</span>
+                </div>
+            </div>
+
+            <div class="hud-metrics">
+                <div class="hud-card">
+                    <span class="val" id="hud-gpu">&#8212;</span>
+                    <span class="lbl">GPU Device</span>
+                </div>
+                <div class="hud-card ram-card">
+                    <div class="val-group">
+                        <span class="val" id="hud-ram-usage">&#8212;</span>
+                        <span class="sub" id="hud-ram-sub">/ &#8212; UMA</span>
+                    </div>
+                    <div class="ram-meter-bg">
+                        <div class="ram-meter-fill" id="hud-ram-fill" style="width: 0%;"></div>
+                    </div>
+                    <span class="lbl">Real-time Model RAM</span>
+                </div>
+                <div class="hud-card">
+                    <span class="val" id="hud-toks">&#8212;</span>
+                    <span class="lbl">Generation Speed</span>
+                </div>
+                <div class="hud-card">
+                    <span class="val" id="hud-io">&#8212;</span>
+                    <span class="lbl">NVMe Read I/O</span>
+                </div>
+                <div class="hud-card">
+                    <span class="val" id="hud-cache">&#8212;</span>
+                    <span class="lbl">Cache Hit Rate</span>
+                </div>
+                <div class="badge" id="hud-status">NO MODEL</div>
+            </div>
+        </header>
+
+        <!-- Main Workspace -->
+        <main>
+            <!-- Chat & Generation Workspace -->
+            <div class="chat-workspace">
+                <!-- System Prompt Bar -->
+                <div class="system-prompt-bar">
+                    <div class="sp-header">
+                        <span class="sp-icon">⚙️</span>
+                        <label for="sys-preset-select">System Prompt Persona:</label>
+                        <select id="sys-preset-select" onchange="applySystemPreset()">
+                            <option value="default" selected>⚡ General AI Assistant</option>
+                            <option value="cpp">💻 C++23 & HLSL DirectCompute Expert</option>
+                            <option value="moe">🚀 MoE & SSD Architecture Specialist</option>
+                            <option value="creative">🎨 Creative Writing & Design Specialist</option>
+                        </select>
+                    </div>
+                    <textarea id="sys-prompt-input" rows="1" placeholder="Custom system instructions...">You are a high-performance MoE AI assistant optimized for AMD Radeon 780M graphics.</textarea>
+                </div>
+
+                <!-- Chat Transcript Area -->
+                <div class="transcript-area" id="transcript">
+                    <div class="msg assistant">
+                        <div class="avatar">⚡</div>
+                        <div class="msg-content">
+                            <div class="bubble">
+                                Welcome to <strong>Turbo-WinFare</strong>! The engine is ready for real-time Gemma 4 26B-A4B MoE SSD streaming inference on your Lenovo Legion Go S APU.
+                                <br><br>
+                                💡 <em>Use the Model Repository sidebar to select or load a <code>.gturbo</code> model, inspect real-time RAM metrics below, or click a preset prompt to begin!</em>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Composer -->
+                <div class="composer-container">
+                    <div class="presets">
+                        <div class="preset-chip" onclick="usePreset('Explain the Gemma 4 26B-A4B MoE SSD streaming architecture on Legion Go S:')">⚡ MoE Architecture</div>
+                        <div class="preset-chip" onclick="usePreset('Write a high-performance C++23 DirectCompute HLSL Wave32 shader for matrix multiplication:')">💻 Write HLSL Shader</div>
+                        <div class="preset-chip" onclick="usePreset('Why is DirectStorage unbuffered async IOCP essential for 16KB expert streaming?')">🚀 DirectStorage I/O</div>
+                        <div class="preset-chip" onclick="usePreset('Compare LFU vs LRU expert cache eviction policies for 16GB UMA laptops:')">📊 Cache Eviction Analysis</div>
+                    </div>
+                    <div class="input-box-wrapper">
+                        <textarea id="prompt-input" placeholder="Type a prompt or instruction... (Shift+Enter for new line)" rows="1" onkeydown="handleKeyDown(event)"></textarea>
+                        <div class="action-buttons">
+                            <button class="btn-clear" title="Clear Transcript" onclick="clearTranscript()">🧹</button>
+                            <button class="btn-send" id="btn-send" onclick="sendPrompt()">➔</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Inspector Panel -->
+            <aside>
+                <!-- Model Repository & Loading Guide -->
+                <div class="panel-section">
+                    <div class="section-title">
+                        <span>📦 Model Repository</span>
+                        <span class="help-tooltip" title="Models are loaded from .gturbo directories containing manifest.json and packed_experts/">❓</span>
+                    </div>
+
+                    <div class="model-guide-card">
+                        <div class="guide-title">How to Load Models:</div>
+                        <div class="guide-text">Place <code>.gturbo</code> model folders in the app directory, then select from the list below and click <strong>Load Model</strong>.</div>
+                    </div>
+
+                    <div class="control-group">
+                        <div class="control-item">
+                            <label class="control-header">Available Model Bundles</label>
+                            <div class="model-select-row">
+                                <select id="model-select">
+                                    <option value="gemma-4-26b-a4b.gturbo">gemma-4-26b-a4b.gturbo (Active)</option>
+                                </select>
+                                <button class="btn-icon" title="Refresh List" onclick="refreshModelList()">🔄</button>
+                            </div>
+                        </div>
+
+                        <div class="btn-row">
+                            <button class="btn-primary" onclick="loadSelectedModel()">⚡ Load Model</button>
+                            <button class="btn-danger" onclick="unloadModel()">🔴 Unload</button>
+                        </div>
+
+                        <!-- Active Model Metadata Card -->
+                        <div class="metadata-card" id="model-meta-card">
+                            <div class="meta-row"><span>Status:</span> <strong id="meta-status" style="color:#f87171">UNLOADED</strong></div>
+                            <div class="meta-row"><span>Model ID:</span> <span id="meta-id">gemma-4-26b-a4b</span></div>
+                            <div class="meta-row"><span>Architecture:</span> <span id="meta-arch">30 Layers • 128 Experts</span></div>
+                            <div class="meta-row"><span>Routed Top-K:</span> <span id="meta-topk">8 Experts / Token</span></div>
+                            <div class="meta-row"><span>Quantization:</span> <span id="meta-quant">MLX affine Int4, group 64 (16KB Sector Aligned)</span></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Real-Time RAM Usage Dashboard -->
+                <div class="panel-section">
+                    <div class="section-title">
+                        <span>🧠 Real-time RAM Usage</span>
+                        <span class="badge-tag" id="ram-total-badge">&#8212;</span>
+                    </div>
+
+                    <div class="control-group">
+                        <!-- Segmented Memory Bar -->
+                        <div class="mem-bar-container">
+                            <!-- Widths and legend figures start empty and are filled by the
+                                 first telemetry poll. They used to be hardcoded (78/17/5% and
+                                 "~2.85 GB"), so the panel showed invented numbers that never
+                                 matched the engine -- the legend stayed at 2.85 GB while the
+                                 real resident set was 1.27 GB. -->
+                            <div class="mem-bar">
+                                <div class="mem-seg seg-resident" id="seg-resident" style="width: 0%;" title="Resident Weights RAM"></div>
+                                <div class="mem-seg seg-kv" id="seg-kv" style="width: 0%;" title="KV Cache RAM"></div>
+                                <div class="mem-seg seg-expert" id="seg-expert" style="width: 0%;" title="Expert DRAM Cache Pool"></div>
+                            </div>
+                            <div class="mem-legend">
+                                <span><i class="dot dot-resident"></i> Resident (<span id="legend-resident">&#8212;</span>)</span>
+                                <span><i class="dot dot-kv"></i> KV Cache (<span id="legend-kv">&#8212;</span>)</span>
+                                <span><i class="dot dot-expert"></i> Expert Pool (<span id="legend-expert">&#8212;</span>)</span>
+                            </div>
+                        </div>
+
+                        <!-- Metric Details Grid -->
+                        <div class="ram-metrics-grid">
+                            <div class="ram-metric">
+                                <span class="lbl">Resident Weights</span>
+                                <span class="val" id="ram-val-resident">&#8212;</span>
+                            </div>
+                            <div class="ram-metric">
+                                <span class="lbl">KV Cache (SWA+Full)</span>
+                                <span class="val" id="ram-val-kv">&#8212;</span>
+                            </div>
+                            <div class="ram-metric">
+                                <span class="lbl">Expert DRAM Pool</span>
+                                <span class="val" id="ram-val-expert">&#8212;</span>
+                            </div>
+                            <div class="ram-metric">
+                                <span class="lbl">Process Working Set</span>
+                                <span class="val" id="ram-val-process">&#8212;</span>
+                            </div>
+                            <div class="ram-metric">
+                                <span class="lbl">System Avail RAM</span>
+                                <span class="val" id="ram-val-sysavail">&#8212;</span>
+                            </div>
+                            <div class="ram-metric">
+                                <span class="lbl">GPU VRAM Used</span>
+                                <span class="val" id="ram-val-vram">&#8212;</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Memory & UMA DRAM Cache Settings -->
+                <div class="panel-section">
+                    <div class="section-title">Memory & DRAM Cache Controls</div>
+                    <div class="control-group">
+                        <div class="control-item">
+                            <div class="control-header">
+                                <span>Max Context Tokens</span>
+                                <span class="val" id="val-context">&#8212;</span>
+                            </div>
+                            <!-- 4096 is the ceiling: ATTN_MAX_SPAN in shaders/Attention.hlsl
+                                 stages scores in 32 KB of groupshared. The list used to offer
+                                 8192 and default to 62000, neither of which the engine can
+                                 initialize. -->
+                            <select id="cfg-context" onchange="updateConfig()">
+                                <option value="1024">1024 Tokens</option>
+                                <option value="2048">2048 Tokens</option>
+                                <option value="4096" selected>4096 Tokens</option>
+                            </select>
+                        </div>
+                        <div class="control-item">
+                            <div class="control-header">
+                                <span>UMA Expert Slots / Layer</span>
+                                <span class="val" id="val-slots">&#8212;</span>
+                            </div>
+                            <input type="range" id="cfg-slots" min="1" max="32" value="16" oninput="updateConfig()" onchange="updateConfig()">
+                        </div>
+                        <div class="control-item">
+                            <div class="control-header">
+                                <span>Eviction Policy</span>
+                                <span class="val" id="val-eviction">LFU</span>
+                            </div>
+                            <select id="cfg-eviction" onchange="updateEvictionPolicy()">
+                                <option value="LFU" selected>LFU (Frequency-Decayed)</option>
+                                <option value="LRU">LRU (Least Recently Used)</option>
+                            </select>
+                        </div>
+                        <!-- Shown when the engine reports requires_reload: context size and
+                             slot count are fixed at initialize() and cannot change live. -->
+                        <div class="reload-notice" id="reload-notice" style="display:none;">
+                            Context size and slot count apply on the next model load. Click
+                            <strong>Load Model</strong> to reinitialize the engine.
+                        </div>
+                        <button class="btn-secondary" onclick="flushExpertCache()">🧹 Flush Expert Cache</button>
+                    </div>
+                </div>
+
+                <!-- Generation Hyperparameters -->
+                <div class="panel-section">
+                    <div class="section-title">Generation Parameters</div>
+                    <div class="control-group">
+                        <div class="control-item">
+                            <div class="control-header">
+                                <span>Temperature</span>
+                                <span class="val" id="val-temp">0.20</span>
+                            </div>
+                            <input type="range" id="cfg-temp" min="0" max="2" step="0.05" value="0.20" oninput="updateConfig()" onchange="updateConfig()">
+                        </div>
+                        <div class="control-item">
+                            <div class="control-header">
+                                <span>Top-P Nucleus</span>
+                                <span class="val" id="val-topp">0.90</span>
+                            </div>
+                            <input type="range" id="cfg-topp" min="0.1" max="1.0" step="0.05" value="0.90" oninput="updateConfig()" onchange="updateConfig()">
+                        </div>
+                        <div class="control-item">
+                            <div class="control-header">
+                                <span>Top-K Sampling</span>
+                                <span class="val" id="val-topk">64</span>
+                            </div>
+                            <!-- Sampling top-K, not the MoE routed top-K (that is fixed at 8
+                                 by the architecture and is not tunable). Range is 1..256:
+                                 top_p &lt; 1 with temperature &gt; 0 requires a bounded top_k. -->
+                            <input type="number" id="cfg-topk" min="1" max="256" value="64" oninput="updateConfig()" onchange="updateConfig()">
+                        </div>
+                        <div class="control-item">
+                            <div class="control-header">
+                                <span>Max Output Tokens</span>
+                                <span class="val" id="val-maxtoks">2000</span>
+                            </div>
+                            <input type="number" id="cfg-maxtoks" min="16" max="8192" value="2000" oninput="updateConfig()" onchange="updateConfig()">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Visualizations & Diagnostics -->
+                <div class="panel-section">
+                    <div class="section-title">Diagnostics</div>
+                    <div class="control-group">
+                        <button class="btn-secondary" onclick="openHeatmapModal()">🔥 Active Expert Heatmap</button>
+                    </div>
+                </div>
+            </aside>
+        </main>
+    </div>
+
+    <!-- Active Expert Heatmap Modal -->
+    <div class="modal-overlay" id="heatmap-modal">
+        <div class="modal-card">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <h2>Active Expert Routing &mdash; Layer 0 (128 Experts)</h2>
+                <button class="btn-secondary" onclick="closeHeatmapModal()">✕ Close</button>
+            </div>
+            <p style="font-size:13px; color:var(--text-secondary);">Highlights the 8 routed MoE experts the router selected for layer 0 on the most recent token. The engine reports layer 0 only.</p>
+            <div class="heatmap-grid" id="heatmap-grid"></div>
+        </div>
+    </div>
+
+    <!-- The Model Repacker modal lived here. It could only ever return an error: in-app
+         repacking was removed because it wrote zero-filled placeholder bundles. Building a
+         bundle streams ~14.6 GB from the pinned checkpoint and belongs in a tool:
+           python tools/convert_hf_to_gturbo.py --output <name>.gturbo -->
+
+    <script src="app.js"></script>
+</body>
+</html>
