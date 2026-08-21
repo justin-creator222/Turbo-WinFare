@@ -1,4 +1,19 @@
-# Turbo-WinFare
+<p align="center">
+  <img src="docs/assets/logo.png" alt="Turbo-WinFare Logo" width="160" height="160" style="border-radius: 32px;" />
+</p>
+
+<h1 align="center">Turbo-WinFare</h1>
+
+<p align="center">
+  <b>Native DirectX 12 MoE Neural Inference Engine for Windows Handhelds & iGPUs</b>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/DirectX-12%20(DirectCompute)-3b82f6?style=flat-square" alt="DirectX 12" />
+  <img src="https://img.shields.io/badge/Platform-Windows%2011-0078D6?style=flat-square" alt="Windows 11" />
+  <img src="https://img.shields.io/badge/Model-Gemma%204%2026B--A4B-8b5cf6?style=flat-square" alt="Gemma 4" />
+  <img src="https://img.shields.io/badge/License-Apache%202.0-10b981?style=flat-square" alt="License" />
+</p>
 
 > **Turbo-WinFare is a Windows port derived from
 > [TurboFieldfare](https://github.com/drumih/turbo-fieldfare), copyright Andrey Mikhaylov,

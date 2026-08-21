@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <radialGradient id="bgGrad" cx="50%" cy="30%" r="75%">
+      <stop offset="0%" stop-color="#141c2e" />
+      <stop offset="60%" stop-color="#0b0e17" />
+      <stop offset="100%" stop-color="#05070a" />
+    </radialGradient>
+    <linearGradient id="borderGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00f2fe" stop-opacity="0.8" />
+      <stop offset="40%" stop-color="#3b82f6" stop-opacity="0.4" />
+      <stop offset="70%" stop-color="#8b5cf6" stop-opacity="0.6" />
+      <stop offset="100%" stop-color="#ec4899" stop-opacity="0.8" />
+    </linearGradient>
+    <linearGradient id="cyanBlueGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00f5ff" />
+      <stop offset="50%" stop-color="#3b82f6" />
+      <stop offset="100%" stop-color="#2563eb" />
+    </linearGradient>
+    <linearGradient id="neonPurpleGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#c084fc" />
+      <stop offset="50%" stop-color="#9333ea" />
+      <stop offset="100%" stop-color="#6366f1" />
+    </linearGradient>
+    <linearGradient id="lightningGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" />
+      <stop offset="30%" stop-color="#67e8f9" />
+      <stop offset="70%" stop-color="#06b6d4" />
+      <stop offset="100%" stop-color="#3b82f6" />
+    </linearGradient>
+    <filter id="neonGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="6" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+  </defs>
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#bgGrad)" stroke="url(#borderGrad)" stroke-width="4" />
+  <g filter="url(#neonGlow)">
+    <circle cx="256" cy="256" r="105" fill="none" stroke="url(#cyanBlueGrad)" stroke-width="4.5" opacity="0.85" />
+    <path d="M120 160 C165 145, 230 155, 275 195 C250 205, 205 210, 160 215 C135 195, 122 175, 120 160 Z" fill="url(#cyanBlueGrad)" opacity="0.95" />
+    <path d="M100 210 C150 195, 215 210, 255 245 C225 255, 180 260, 138 262 C115 245, 105 225, 100 210 Z" fill="url(#cyanBlueGrad)" opacity="0.85" />
+    <path d="M90 265 C135 255, 195 265, 230 295 C200 302, 160 305, 120 305 C100 290, 92 278, 90 265 Z" fill="url(#neonPurpleGrad)" opacity="0.8" />
+    <path d="M260 185 C295 160, 350 155, 385 170 C410 180, 425 190, 435 192 C415 205, 395 212, 380 218 C365 240, 345 265, 315 285 C310 260, 305 230, 280 210 Z" fill="url(#cyanBlueGrad)" />
+    <circle cx="370" cy="188" r="6" fill="#ffffff" />
+    <circle cx="370" cy="188" r="3" fill="#00f5ff" />
+    <path d="M210 320 C185 365, 140 405, 105 425 C135 395, 165 360, 185 328 Z" fill="url(#neonPurpleGrad)" opacity="0.9" />
+    <polygon points="285,130 215,260 265,260 220,385 325,235 270,235" fill="url(#lightningGrad)" stroke="#ffffff" stroke-width="2" />
+    <circle cx="256" cy="256" r="20" fill="#080d1a" stroke="url(#cyanBlueGrad)" stroke-width="3" />
+    <circle cx="256" cy="256" r="8" fill="#00f5ff" />
+  </g>
+</svg>
