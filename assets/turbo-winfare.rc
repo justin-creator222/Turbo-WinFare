@@ -1,0 +1,9 @@
+// Application icon for turbo-winfare.exe.
+//
+// Explorer, the taskbar and the Alt-Tab list pick the icon resource with the LOWEST numeric
+// ID, so this is a bare 1 rather than a named constant -- IDI_ICON1 is a Visual Studio
+// resource.h convention and is not defined by MinGW's windows.h.
+//
+// The .ico path is resolved against windres' include path, which CMakeLists.txt points at
+// this directory. Regenerate the .ico with tools/make_icon.ps1 if the logo changes.
+1 ICON "turbo-winfare.ico"

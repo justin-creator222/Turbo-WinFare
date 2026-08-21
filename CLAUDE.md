@@ -36,6 +36,24 @@ CMake copies `gui/` and `shaders/` into the build directory on every build; shad
 
 Toolchain bootstrap: `python tools/download_toolchain.py` installs w64devkit to `C:\w64devkit` **and** fetches `dxcompiler.dll` + `dxil.dll` into `build/`. Both are required -- **`C:\w64devkit\bin` must be on `PATH`** or g++ fails with `cannot execute 'as'`, and without DXC every shader fails to compile (there is deliberately no `cs_5_0` fallback).
 
+The `turbo-winfare` target also compiles [assets/turbo-winfare.rc](assets/turbo-winfare.rc)
+with `windres`, which embeds `assets/turbo-winfare.ico` as icon resource **1** -- the shell
+picks the lowest resource ID, so that number is load-bearing. The `.ico` is committed;
+[tools/make_icon.ps1](tools/make_icon.ps1) regenerates it from `gui/logo.png` and only needs
+running when the artwork changes. Two things it encodes that are easy to lose:
+
+- **Every entry is an uncompressed DIB, including 256x256.** Windows reads PNG-compressed ICO
+  entries fine, but many other consumers assume a `BITMAPINFOHEADER` and render a PNG payload
+  as noise -- .NET Framework's own `System.Drawing.Icon` among them, which is what caught it
+  here. All-DIB costs ~150 KB and is a file you can actually read back and verify.
+- The artwork is a small squircle on a large dark canvas, so the script crops to the measured
+  border box and cuts the corners to transparent along the *same* radius (~170 at the cropped
+  scale). A mismatched radius reads as a doubled corner.
+
+Note `gui/logo.png` is really a **JPEG** -- it starts with the JFIF magic, not the PNG
+signature. Browsers sniff the content so the GUI is unaffected, but anything pointing a real
+PNG decoder at it (Python's stdlib, for one) fails on a file that looks like it should work.
+
 ## Running the app
 
 Two front-ends both talk to the same engine core:

@@ -453,6 +453,16 @@ function clearTranscript() {
     `;
 }
 
+// Autoscroll only while the reader is already at the bottom. Forcing scrollTop on every
+// token makes the transcript impossible to scroll back through during generation.
+function isPinnedToBottom(el) {
+    return el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+}
+
+function scrollToBottom(el) {
+    el.scrollTop = el.scrollHeight;
+}
+
 function appendUserMessage(text) {
     const transcript = document.getElementById('transcript');
     const msg = document.createElement('div');
@@ -464,7 +474,7 @@ function appendUserMessage(text) {
         </div>
     `;
     transcript.appendChild(msg);
-    transcript.scrollTop = transcript.scrollHeight;
+    scrollToBottom(transcript);
 }
 
 function createAssistantMessage() {
@@ -478,15 +488,18 @@ function createAssistantMessage() {
         </div>
     `;
     transcript.appendChild(msg);
-    transcript.scrollTop = transcript.scrollHeight;
+    scrollToBottom(transcript);
     return msg.querySelector('.bubble');
 }
 
 function appendToken(text) {
     if (currentBubble) {
-        currentBubble.innerText += text;
         const transcript = document.getElementById('transcript');
-        transcript.scrollTop = transcript.scrollHeight;
+        // Sample before mutating: appending grows scrollHeight, which would make an
+        // already-scrolled-up reader look "at the bottom" on the very next token.
+        const stick = isPinnedToBottom(transcript);
+        currentBubble.innerText += text;
+        if (stick) scrollToBottom(transcript);
     }
 }
 

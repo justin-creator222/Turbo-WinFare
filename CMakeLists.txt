@@ -38,6 +38,19 @@ endif()
 add_executable(turbo-winfare src/main.cpp)
 target_link_libraries(turbo-winfare PRIVATE turbo_engine_lib)
 
+# Application icon. Without a resource the shell falls back to the generic executable glyph,
+# which makes turbo-winfare.exe indistinguishable from every other .exe in a folder listing.
+#
+# windres resolves the ICON filename against its include path rather than against the .rc
+# file's own directory, so assets/ has to be on that path explicitly. CMake feeds <INCLUDES>
+# from the target's include directories, which would also apply to the C++ compiles, so this
+# goes through CMAKE_RC_FLAGS instead.
+if (WIN32)
+    enable_language(RC)
+    set(CMAKE_RC_FLAGS "${CMAKE_RC_FLAGS} -I \"${CMAKE_CURRENT_SOURCE_DIR}/assets\"")
+    target_sources(turbo-winfare PRIVATE assets/turbo-winfare.rc)
+endif()
+
 # The repacker target is gone. It only ever wrote zero-filled placeholder bundles, and its
 # main() had already been reduced to an error message. Use tools/convert_hf_to_gturbo.py.
 
