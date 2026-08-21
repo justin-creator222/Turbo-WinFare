@@ -10,6 +10,41 @@ All numbers below were measured on a 24 GB Ryzen/Radeon development box generati
 > table below was measured sequentially and its *relative* gains hold, but treat the absolute
 > numbers as one session's snapshot.
 
+## Measurement hygiene — two traps that have already cost a day
+
+Both of these produced confident, wrong conclusions. Neither is visible in the output.
+
+**1. Background disk I/O invalidates the measurement completely.** An audit once reported a
+≈40% regression against this document. There was no regression: a game download was running.
+Same binary, same flags, *bit-identical* workload (38,985 MB in 12,171 reads, 64.78% cache hit
+both times) — the only difference was the machine:
+
+| 24 slots, 120 tokens | contended | idle |
+|---|---|---|
+| decode | 5.07 tok/s | **6.03** |
+| expert I/O | 107.9 ms | **81.9** |
+| I/O throughput | 1957 MB/s | **3306** |
+| CPU other | 11.3 ms | **4.3** |
+| GPU wait | 78.1 ms | 79.3 (unchanged) |
+
+Decode is I/O-bound, so anything touching the NVMe competes directly — and a large download also
+evicts the expert pages the streamer deliberately leans on the OS page cache to hold. Confirm the
+disk is idle before believing any number:
+
+```powershell
+(Get-Counter '\PhysicalDisk(_Total)\Current Disk Queue Length' -SampleInterval 1 -MaxSamples 3).CounterSamples.CookedValue
+```
+
+**2. A sequential sweep measures page-cache warmth, not the variable you changed.** Sweeping
+`--slots 16, 24, 32, 40` in order shows every configuration getting faster, because each run
+inherits a warmer cache from the last. That artefact once turned a real +27% into an apparent
++50%, and made 16 slots tie with 24. **Alternate configurations A/B/A/B for at least three
+rounds and compare medians.** Interleaved, the spread within one configuration is ±0.05 tok/s;
+sequentially it is over 1 tok/s.
+
+**Check the exit code.** A failed run prints a diagnostic and exits non-zero, but a `grep` for
+metric lines shows an empty row that looks like a slow result rather than a crash.
+
 ## Where it got to
 
 | Stage | decode | expert I/O | GPU wait | CPU other |
@@ -25,6 +60,40 @@ All numbers below were measured on a 24 GB Ryzen/Radeon development box generati
 Reference points: TurboFieldfare reaches 5.1–6.3 tok/s on an 8 GB M2 Air. The 16-slot
 configuration here — the 16 GB Legion Go S target — reaches **6.54 tok/s**, so the reference is
 beaten on the constrained configuration too.
+
+## Trading RAM for speed (`--slots`)
+
+Defaults are deliberately conservative and **do not change**: the ladder auto-sizes to 16 / 24 / 32
+slots per layer at ≤16 / ≤24 / ≥32 GB installed. Raising it is an explicit opt-in, either
+`--slots N` on the CLI or the sidebar control followed by a model reload.
+
+Measured on the 24 GB box, interleaved, 120 tokens, machine idle:
+
+| slots | pool | peak RSS | cache hit | decode |
+|---|---|---|---|---|
+| 16 | 1.5 GB | ~3.3 GB | 54.1% | 6.0 |
+| 24 *(auto here)* | 2.3 GB | 4.3 GB | 64.8% | **7.0** |
+| 44 | 4.1 GB | 6.2 GB | 82.7% | **9.2** |
+| 64 | 6.0 GB | ~8.1 GB | 90.3% | 7.8–8.9 |
+
+**About +30% for roughly 2 GB**, and the sweet spot on this machine is around 44. Note that 64
+slots is *not* faster despite a 90% hit rate: the pool competes with the OS page cache for the
+same physical memory, so past a point more cache buys hit rate and gives back throughput. The
+same effect is why the auto-size ladder stops at 32. Footprint is predictable:
+
+```
+peak RSS  ≈  1.29 GB (resident weights)  +  KV cache  +  slots × 30 × 3.2 MB
+```
+
+Two ceilings bound `--slots`, and both now report themselves at startup rather than failing
+later:
+
+- **Descriptor heap.** Capacity is derived from the slot count by
+  `ComputePipelineManager::descriptors_for()`. Previously hardcoded at 65,536, which fit exactly
+  44 slots and then threw `Descriptor heap exhausted` *mid-generation*, dozens of tokens in.
+- **The adapter's shared-memory budget**, typically about half of installed RAM (12.2 GB here),
+  is the real cap on UMA allocation — not installed RAM. Overshooting it does not degrade, it
+  fails, so a warning fires at load when the pool plus resident weights will not fit.
 
 **Where the time goes now:** ~34% expert I/O, ~41% GPU wait, ~9% LM head, ~16% other CPU. The
 engine is nowhere near compute- or DRAM-bound — Stage 3 measured 0.2% of peak ALU and ~6% of DRAM

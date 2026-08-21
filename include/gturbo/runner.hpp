@@ -16,6 +16,7 @@
 #include <chrono>
 #include <atomic>
 #include <functional>
+#include <mutex>
 
 namespace gturbo {
 
@@ -167,6 +168,15 @@ public:
     void set_expert_slots(size_t slots) { requested_slots_ = slots; }
     size_t expert_slots_per_layer() const { return expert_slots_per_layer_; }
 
+    // The auto-sizing ladder and its bounds, as pure logic. `requested` of 0 means auto;
+    // `total_ram_bytes` of 0 means "unknown", which assumes the low tier. Clamps to
+    // num_experts (a bigger pool can never fill) and throws below top_k_experts + 1 (a
+    // pool that small deadlocks eviction). Callers that validate a user-supplied value
+    // before load -- the HTTP config endpoint, the CLI -- should use this rather than
+    // duplicating the thresholds.
+    static size_t resolve_slots(size_t requested, uint64_t total_ram_bytes,
+                                int top_k_experts, int num_experts);
+
     // Max context in tokens. 0 = auto-size from installed RAM. Must be set before
     // initialize(); capped by the attention kernel's staged-score span.
     void set_max_context(int tokens) { requested_context_ = tokens; }
@@ -274,7 +284,9 @@ private:
     std::atomic<bool> stop_requested_{false};
     StopReason last_stop_reason_{StopReason::MaxTokens};
     EvictionPolicy eviction_policy_{EvictionPolicy::LFU};
+    // Written by produce_token, read by telemetry from an HTTP handler thread.
     std::vector<int> last_active_experts_;
+    mutable std::mutex active_experts_mutex_;
     mutable std::mutex streamer_mutex_;
 
     ExpertStreamer* ensure_streamer_opened(int layer);

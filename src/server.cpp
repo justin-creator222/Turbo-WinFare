@@ -23,9 +23,170 @@ HTTPServer::~HTTPServer() {
     stop();
 }
 
-void HTTPServer::start(uint16_t port, std::shared_ptr<ForwardRunner> runner, std::shared_ptr<D3D12Context> ctx) {
-    runner_ = runner;
+std::shared_ptr<ForwardRunner> HTTPServer::current_runner() const {
+    std::lock_guard<std::mutex> guard(runner_mutex_);
+    return runner_;
+}
+
+std::shared_ptr<D3D12Context> HTTPServer::current_ctx() const {
+    std::lock_guard<std::mutex> guard(runner_mutex_);
+    return ctx_;
+}
+
+void HTTPServer::set_context(std::shared_ptr<D3D12Context> ctx) {
+    std::lock_guard<std::mutex> guard(runner_mutex_);
     ctx_ = ctx;
+}
+
+void HTTPServer::set_load_error(const std::string& message) {
+    std::lock_guard<std::mutex> guard(runner_mutex_);
+    load_error_ = message;
+}
+
+void HTTPServer::set_openai_config(const OpenAIServerConfig& cfg) {
+    std::lock_guard<std::mutex> guard(runner_mutex_);
+    openai_cfg_ = cfg;
+}
+
+OpenAIServerConfig HTTPServer::openai_config() const {
+    std::lock_guard<std::mutex> guard(runner_mutex_);
+    return openai_cfg_;
+}
+
+void HTTPServer::set_initial_engine_config(int context_len, int slots) {
+    std::lock_guard<std::mutex> guard(config_mutex_);
+    config_.context_len = context_len;
+    config_.slots = slots;
+}
+
+// Replaces the live runner, or tears it down when `load` is false.
+//
+// The ordering here is load-bearing:
+//
+//  1. try_lock generate_mutex_ and hold it for the whole swap. This is what upholds the
+//     "runner_ is only republished while generate_mutex_ is held" invariant, and it is why
+//     /api/stop can skip the lock safely. try_lock rather than a blocking lock because a
+//     generation can run for minutes and the GUI polls with no timeout handling.
+//  2. Release the OLD runner and flush the GPU BEFORE building the new one. This gives up
+//     the previous "a failed load leaves the old model in place" behaviour on purpose:
+//     holding both alive means two resident-weight buffers, two KV caches and two slot
+//     pools at once, and at 128 slots that is 2 x 12.9 GB. Not double-committing matters
+//     more, and the GUI already surfaces load_error_ when the new load fails.
+//  3. initialize() runs WITHOUT runner_mutex_ held, so /api/telemetry keeps answering
+//     during a multi-GB load instead of freezing the UI exactly when it should show progress.
+bool HTTPServer::swap_runner(const std::string& model_dir, bool load, std::string& error) {
+    std::unique_lock<std::mutex> gen(generate_mutex_, std::try_to_lock);
+    if (!gen.owns_lock()) {
+        error = "BUSY:A generation is in progress. POST /api/stop first, or retry.";
+        return false;
+    }
+
+    // Take the config the user actually asked for. THIS is the fix for the reload path
+    // silently discarding it: the runner was previously constructed and initialized with
+    // neither setter called, so every reload fell back to RAM auto-sizing and the GUI's
+    // "click Load Model to reinitialize" instruction was false.
+    ServerConfig cfg;
+    {
+        std::lock_guard<std::mutex> guard(config_mutex_);
+        cfg = config_;
+    }
+
+    std::shared_ptr<D3D12Context> ctx = current_ctx();
+
+    // Resolve and VALIDATE before touching the live runner.
+    //
+    // Both halves of this matter. Resolution: a bare bundle name is resolved against the
+    // working directory first, and running from build/ that is where the retired repacker's
+    // stale placeholder lives -- so an unresolved name loaded a bundle whose layout.json
+    // predates the expertBlock format, while startup (which resolves properly) had loaded
+    // the real one. Validation: parsing costs nothing, and doing it here means a bad path
+    // cannot cost the user a working model, which is the one real downside of releasing the
+    // old runner first.
+    std::string resolved = model_dir;
+    GTurboManifestV1 manifest;
+    PackedExpertsLayoutV1 layout;
+    if (load) {
+        resolved = resolve_bundle_path(model_dir);
+        try {
+            manifest = GTurboManifestV1::from_json_string(
+                read_text_file(resolved + "/manifest.json"));
+            layout = PackedExpertsLayoutV1::from_json_string(
+                read_text_file(resolved + "/packed_experts/layout.json"));
+            layout.cross_validate(manifest);
+        } catch (const std::exception& ex) {
+            // The previously loaded model is untouched.
+            error = std::string(ex.what()) + " (resolved '" + model_dir + "' to '" +
+                    resolved + "')";
+            std::lock_guard<std::mutex> guard(runner_mutex_);
+            load_error_ = error;
+            return false;
+        }
+    }
+
+    // Drop the old runner first -- see (2) above.
+    {
+        std::shared_ptr<ForwardRunner> old;
+        {
+            std::lock_guard<std::mutex> guard(runner_mutex_);
+            old = std::move(runner_);
+            runner_ = nullptr;
+        }
+        if (old && ctx) {
+            // The runner's buffers may still be referenced by command lists in flight.
+            ctx->flush_gpu();
+        }
+        old.reset();
+    }
+
+    if (!load) {
+        return true;
+    }
+
+    try {
+        if (!ctx) {
+            ctx = std::make_shared<D3D12Context>();
+            ctx->initialize(false);
+            std::lock_guard<std::mutex> guard(runner_mutex_);
+            ctx_ = ctx;
+        }
+
+        auto next = std::make_shared<ForwardRunner>(ctx, manifest, layout, resolved);
+        // 0 means "auto-size from RAM" in both the config and the runner, so the sentinel
+        // passes straight through.
+        next->set_expert_slots(static_cast<size_t>(cfg.slots > 0 ? cfg.slots : 0));
+        next->set_max_context(cfg.context_len);
+        next->initialize();
+
+        {
+            std::lock_guard<std::mutex> guard(runner_mutex_);
+            runner_ = std::move(next);
+            load_error_.clear();
+            // main.cpp snapshots max_context once at startup, so without this refresh the
+            // /v1 max_tokens clamp keeps using the pre-reload value forever.
+            openai_cfg_.max_context = runner_->max_context();
+        }
+        return true;
+    } catch (const std::exception& ex) {
+        error = ex.what();
+        std::lock_guard<std::mutex> guard(runner_mutex_);
+        load_error_ = error;
+        return false;
+    }
+}
+
+void HTTPServer::start(uint16_t port, std::shared_ptr<ForwardRunner> runner, std::shared_ptr<D3D12Context> ctx) {
+    {
+        std::lock_guard<std::mutex> guard(runner_mutex_);
+        runner_ = runner;
+        ctx_ = ctx;
+    }
+    // Constructed here rather than lazily on the first /v1 request. That lazy path ran from
+    // a detached handler thread with no synchronization, so two concurrent first requests
+    // both saw null, both constructed one, and one unique_ptr assignment destroyed the
+    // other's object while a Lease still pointed at it.
+    if (!coordinator_) {
+        coordinator_ = std::make_unique<RequestCoordinator>(openai_cfg_.queue_limit);
+    }
     is_running_ = true;
     server_thread_ = std::thread(&HTTPServer::listen_loop, this, port);
 }
@@ -187,19 +348,49 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
             bool first = true;
             std::vector<std::string> model_paths;
 
-            for (const auto& entry : fs::directory_iterator(".")) {
-                if (entry.is_directory()) {
-                    std::string p = entry.path().filename().string();
-                    if (p.size() > 7 && p.compare(p.size() - 7, 7, ".gturbo") == 0) {
-                        model_paths.push_back(p);
+            // Search every root the loader would search, not just the working directory,
+            // and list only bundles that actually parse. Scanning "." alone offered the
+            // stale placeholder in build/ as if it were the real model -- it has both
+            // manifest.json and layout.json, so nothing short of parsing rejects it.
+            std::error_code scan_ec;
+            for (const auto& root : bundle_search_roots()) {
+                for (const auto& entry : fs::directory_iterator(root, scan_ec)) {
+                    if (scan_ec) break;
+                    if (!entry.is_directory(scan_ec)) continue;
+                    const std::string name = entry.path().filename().string();
+                    if (name.size() <= 7 || name.compare(name.size() - 7, 7, ".gturbo") != 0) {
+                        continue;
                     }
+                    if (!bundle_loads(entry.path().string())) continue;
+                    // Offer the bare name when it resolves back to this same directory, so
+                    // the GUI keeps showing a readable label; otherwise the full path, so a
+                    // shadowed bundle is still selectable and unambiguous.
+                    const std::string label =
+                        (resolve_bundle_path(name) == entry.path().string())
+                            ? name : entry.path().string();
+                    bool seen = false;
+                    for (const auto& m : model_paths) seen = seen || (m == label);
+                    if (!seen) model_paths.push_back(label);
                 }
             }
 
+            auto runner = current_runner();
             for (const auto& mpath : model_paths) {
                 if (!first) json << ",";
                 first = false;
-                bool is_active = (runner_ && runner_->model_dir() == mpath);
+                // Compare resolved locations, not the raw strings. The runner stores the
+                // path it was loaded from (absolute, once resolution has run) while this
+                // list emits a bare bundle name, so a plain == never matched -- which left
+                // every entry reporting is_active:false and null architecture, and in turn
+                // left the GUI unable to bound the slot slider by the model's real expert
+                // count.
+                bool is_active = false;
+                if (runner) {
+                    std::error_code eq_ec;
+                    const fs::path a = fs::weakly_canonical(resolve_bundle_path(mpath), eq_ec);
+                    const fs::path b = fs::weakly_canonical(runner->model_dir(), eq_ec);
+                    is_active = !eq_ec && !a.empty() && a == b;
+                }
                 json << "{"
                      << "\"path\":" << JsonValue::quote(mpath) << ","
                      << "\"id\":" << JsonValue::quote(mpath) << ","
@@ -207,7 +398,7 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
                 // Architecture is only known for a loaded bundle; reporting it for an
                 // unopened directory would be a guess.
                 if (is_active) {
-                    const auto& arch = runner_->manifest().arch;
+                    const auto& arch = runner->manifest().arch;
                     json << "\"layers\":" << arch.num_layers << ","
                          << "\"experts\":" << arch.num_experts << ","
                          << "\"top_k\":" << arch.top_k_experts << ",";
@@ -234,9 +425,10 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
                 std::lock_guard<std::mutex> lock(config_mutex_);
                 cfg = config_;
             }
-            int live_ctx   = runner_ ? runner_->max_context() : cfg.context_len;
-            int live_slots = runner_ ? static_cast<int>(runner_->expert_slots_per_layer())
-                                     : cfg.slots;
+            auto runner = current_runner();
+            int live_ctx   = runner ? runner->max_context() : cfg.context_len;
+            int live_slots = runner ? static_cast<int>(runner->expert_slots_per_layer())
+                                    : cfg.slots;
 
             std::ostringstream json;
             json << "{\"status\":\"OK\",\"config\":{"
@@ -245,17 +437,33 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
                  << "\"top_k\":" << cfg.top_k << ","
                  << "\"max_tokens\":" << cfg.max_tokens << ","
                  << "\"eviction_policy\":\""
-                 << ((runner_ && runner_->eviction_policy() == EvictionPolicy::LRU) ? "LRU" : "LFU")
+                 << ((runner && runner->eviction_policy() == EvictionPolicy::LRU) ? "LRU" : "LFU")
                  << "\","
                  << "\"context_len\":" << (cfg.context_len ? cfg.context_len : live_ctx) << ","
-                 << "\"slots\":" << (cfg.slots ? cfg.slots : live_slots)
+                 // The hard ceiling on context, so the GUI can build its dropdown from the
+                 // engine rather than hardcoding a ladder that drifts out of sync with
+                 // ATTN_MAX_SPAN. Requesting more than this throws at load.
+                 << "\"context_max\":" << ForwardRunner::kAttentionMaxSpan << ","
+                 << "\"slots\":" << (cfg.slots ? cfg.slots : live_slots) << ","
+                 // The *_active pair is what the engine is actually running, as distinct
+                 // from what has been requested for the next load. Reporting only the
+                 // requested value meant that once the GUI had POSTed anything, /api/config
+                 // echoed that number forever even though nothing had been applied -- so a
+                 // pending change was indistinguishable from a live one.
+                 << "\"context_len_active\":" << live_ctx << ","
+                 << "\"slots_active\":" << live_slots << ","
+                 << "\"reload_pending\":"
+                 << (((cfg.context_len && cfg.context_len != live_ctx) ||
+                      (cfg.slots && cfg.slots != live_slots)) ? "true" : "false")
                  << "}}";
             send_json_response(client, json.str());
 
         } else if (path == "/api/telemetry") {
             D3D12Context::SystemMemoryInfo sys_mem{};
-            if (ctx_) {
-                sys_mem = ctx_->query_memory_info();
+            auto runner = current_runner();
+            auto tctx = current_ctx();
+            if (tctx) {
+                sys_mem = tctx->query_memory_info();
             }
 
             ModelMemoryUsage mod_mem{};
@@ -264,11 +472,11 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
             bool active = false;
             std::vector<int> active_experts;
 
-            if (runner_) {
-                mod_mem = runner_->get_memory_usage();
-                perf = runner_->metrics();
-                model_dir = runner_->model_dir();
-                active_experts = runner_->last_active_experts();
+            if (runner) {
+                mod_mem = runner->get_memory_usage();
+                perf = runner->metrics();
+                model_dir = runner->model_dir();
+                active_experts = runner->last_active_experts();
                 active = true;
             }
 
@@ -279,7 +487,7 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
                  // path, so interpolating it raw emitted "C:\Users\..." -- an invalid escape
                  // that made the whole telemetry document unparseable, silently breaking the
                  // GUI's 1.5 s poll.
-                 << "\"gpu_name\":" << JsonValue::quote(ctx_ ? ctx_->adapter_name() : "No D3D12 device") << ","
+                 << "\"gpu_name\":" << JsonValue::quote(tctx ? tctx->adapter_name() : "No D3D12 device") << ","
                  << "\"model_active\":" << (active ? "true" : "false") << ","
                  << "\"model_dir\":" << JsonValue::quote(model_dir) << ","
                  << "\"load_error\":"
@@ -308,7 +516,7 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
                      << "\"eviction_policy\":\""
                      // Read the live policy off the runner rather than a server-side mirror
                      // that nothing ever wrote, which always reported LFU.
-                     << ((runner_ && runner_->eviction_policy() == EvictionPolicy::LRU) ? "LRU" : "LFU")
+                     << ((runner && runner->eviction_policy() == EvictionPolicy::LRU) ? "LRU" : "LFU")
                      << "\""
                  << "},"
                  << "\"active_experts\":[";
@@ -357,6 +565,19 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
                 std::string mime = "text/html; charset=utf-8";
                 if (ext == ".css") mime = "text/css; charset=utf-8";
                 else if (ext == ".js") mime = "application/javascript; charset=utf-8";
+                // Binary/vector assets must NOT inherit the text/html fallback. logo.svg was
+                // served as text/html, and a browser refuses to render an <img> whose type is
+                // a document type -- the header showed the alt text ("Turbo-WinFare Logo",
+                // clipped to "Turb") in place of the icon, which looked like a missing file
+                // rather than a wrong header.
+                else if (ext == ".svg") mime = "image/svg+xml; charset=utf-8";
+                else if (ext == ".png") mime = "image/png";
+                else if (ext == ".jpg" || ext == ".jpeg") mime = "image/jpeg";
+                else if (ext == ".webp") mime = "image/webp";
+                else if (ext == ".gif") mime = "image/gif";
+                else if (ext == ".ico") mime = "image/x-icon";
+                else if (ext == ".woff2") mime = "font/woff2";
+                else if (ext == ".json") mime = "application/json; charset=utf-8";
 
                 std::ostringstream resp;
                 resp << "HTTP/1.1 200 OK\r\n"
@@ -440,7 +661,7 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
             } else if (prompt.empty() && messages.empty()) {
                 send_json_response(client,
                     "{\"status\":\"ERROR\", \"message\":\"Request needs either 'prompt' or 'messages'.\"}", 400);
-            } else if (!runner_) {
+            } else if (!current_runner()) {
                 send_json_response(client,
                     "{\"status\":\"ERROR\", \"message\":\"No model loaded. Load a .gturbo bundle first.\"}", 409);
             } else {
@@ -461,7 +682,14 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
                             }
                             messages.push_back({"user", prompt});
                         }
-                        auto result = runner_->generate_chat(messages, opts);
+                        // Snapshot under the generation lock: the null check above raced a
+                        // concurrent reload, and dereferencing the member directly let that
+                        // reload destroy the runner mid-call.
+                        auto runner = current_runner();
+                        if (!runner) {
+                            throw GTurboFormatError("Model was unloaded before generation started.");
+                        }
+                        auto result = runner->generate_chat(messages, opts);
 
                         std::ostringstream json_resp;
                         json_resp << "{\"status\":\"SUCCESS\","
@@ -490,6 +718,11 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
             } else {
                 bool requires_reload = false;
                 ServerConfig applied;
+                std::string reject;
+                // Snapshot before taking config_mutex_: the lock order is
+                // generate_mutex_ -> runner_mutex_ -> config_mutex_, so acquiring
+                // runner_mutex_ while holding config_mutex_ would reverse it.
+                auto cfg_runner = current_runner();
                 {
                     std::lock_guard<std::mutex> cfg(config_mutex_);
                     config_.temperature = static_cast<float>(req_json.double_or("temperature", config_.temperature));
@@ -504,8 +737,9 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
                         config_.eviction_policy = (p == "lru") ? EvictionPolicy::LRU : EvictionPolicy::LFU;
                     }
 
-                    // Slot count and context size are fixed at initialize(); accepting them
-                    // silently would report success for a change that never happened.
+                    // Slot count and context size take effect on the next model load, not
+                    // immediately -- both are fixed at initialize(). Accepting them silently
+                    // would report success for a change that had not happened.
                     //
                     // Compare against the *resolved* values, because a stored 0 means
                     // "auto-size from RAM" rather than a literal zero. The GUI seeds its
@@ -513,19 +747,53 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
                     // the very first slider touch claim a reload was needed when nothing had
                     // actually changed.
                     int cur_ctx = config_.context_len ? config_.context_len
-                                : (runner_ ? runner_->max_context() : 0);
+                                : (cfg_runner ? cfg_runner->max_context() : 0);
                     int cur_slots = config_.slots ? config_.slots
-                                  : (runner_ ? static_cast<int>(runner_->expert_slots_per_layer()) : 0);
+                                  : (cfg_runner ? static_cast<int>(cfg_runner->expert_slots_per_layer()) : 0);
                     int new_ctx   = static_cast<int>(req_json.int_or("context_len", cur_ctx));
                     int new_slots = static_cast<int>(req_json.int_or("slots", cur_slots));
-                    requires_reload = (new_ctx != cur_ctx) || (new_slots != cur_slots);
-                    config_.context_len = new_ctx;
-                    config_.slots = new_slots;
+
+                    // Validate at accept time. These used to be stored verbatim and echoed
+                    // back as SUCCESS, so `slots: 999` looked applied and only exploded on
+                    // the next load -- which, now that a reload actually honours them, would
+                    // turn a typo into a dead engine.
+                    if (new_ctx != 0 && (new_ctx < 1 || new_ctx > ForwardRunner::kAttentionMaxSpan)) {
+                        reject = "context_len must be between 1 and " +
+                                 std::to_string(ForwardRunner::kAttentionMaxSpan) +
+                                 " (0 auto-sizes from RAM).";
+                    } else if (new_slots != 0 && cfg_runner) {
+                        const auto& arch = cfg_runner->manifest().arch;
+                        if (new_slots <= arch.top_k_experts) {
+                            reject = "slots must exceed top_k_experts (" +
+                                     std::to_string(arch.top_k_experts) + "); use at least " +
+                                     std::to_string(arch.top_k_experts + 1) +
+                                     " (0 auto-sizes from RAM).";
+                        } else if (new_slots > arch.num_experts) {
+                            reject = "slots cannot exceed the " +
+                                     std::to_string(arch.num_experts) +
+                                     " experts per layer; a larger pool can never fill.";
+                        }
+                    } else if (new_slots != 0 && new_slots < 1) {
+                        reject = "slots must be positive (0 auto-sizes from RAM).";
+                    }
+
+                    if (reject.empty()) {
+                        requires_reload = (new_ctx != cur_ctx) || (new_slots != cur_slots);
+                        config_.context_len = new_ctx;
+                        config_.slots = new_slots;
+                    }
                     applied = config_;
                 }
 
-                if (runner_) {
-                    runner_->set_eviction_policy(applied.eviction_policy);
+                if (!reject.empty()) {
+                    send_json_response(client,
+                        "{\"status\":\"ERROR\", \"message\":" + JsonValue::quote(reject) + "}", 400);
+                    closesocket(client);
+                    return;
+                }
+
+                if (cfg_runner) {
+                    cfg_runner->set_eviction_policy(applied.eviction_policy);
                 }
 
                 std::ostringstream json;
@@ -549,49 +817,62 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
                 ? req_json.string_or("model_path", "gemma-4-26b-a4b.gturbo")
                 : std::string("gemma-4-26b-a4b.gturbo");
 
-            try {
-                if (!ctx_) {
-                    ctx_ = std::make_shared<D3D12Context>();
-                    ctx_->initialize(false);
-                }
-
-                auto manifest = GTurboManifestV1::from_json_string(
-                    read_text_file(target_path + "/manifest.json"));
-                auto layout = PackedExpertsLayoutV1::from_json_string(
-                    read_text_file(target_path + "/packed_experts/layout.json"));
-                layout.cross_validate(manifest);
-
-                // Only replace the live runner once the new one has loaded, so a failed
-                // load leaves the previously working model in place.
-                auto next = std::make_shared<ForwardRunner>(ctx_, manifest, layout, target_path);
-                next->initialize();
-                runner_ = std::move(next);
-                load_error_.clear();
-
+            std::string error;
+            if (swap_runner(target_path, /*load=*/true, error)) {
                 std::ostringstream json;
-                json << "{\"status\":\"SUCCESS\", \"message\":\"Successfully loaded model bundle: " << target_path << "\"}";
+                json << "{\"status\":\"SUCCESS\", \"message\":\"Successfully loaded model bundle: "
+                     << escape_json_string(target_path) << "\"}";
                 send_json_response(client, json.str());
-            } catch (const std::exception& ex) {
-                load_error_ = ex.what();
+            } else {
+                // 409 when a generation is in flight, 500 when the load itself failed. The
+                // GUI needs to tell "try again in a moment" from "this bundle is broken".
+                const bool busy = error.rfind("BUSY:", 0) == 0;
                 std::ostringstream json;
-                json << "{\"status\":\"ERROR\", \"message\":\"Failed to load model: "
-                     << escape_json_string(ex.what()) << "\"}";
-                send_json_response(client, json.str(), 500);
+                json << "{\"status\":\"ERROR\", \"message\":\""
+                     << escape_json_string(busy ? error.substr(5) : "Failed to load model: " + error)
+                     << "\"}";
+                send_json_response(client, json.str(), busy ? 409 : 500);
             }
 
         } else if (path == "/api/unload_model") {
-            runner_ = nullptr;
-            send_json_response(client, "{\"status\":\"SUCCESS\", \"message\":\"Model successfully unloaded from UMA RAM.\"}");
+            std::string error;
+            if (swap_runner("", /*load=*/false, error)) {
+                send_json_response(client,
+                    "{\"status\":\"SUCCESS\", \"message\":\"Model successfully unloaded from UMA RAM.\"}");
+            } else {
+                std::ostringstream json;
+                json << "{\"status\":\"ERROR\", \"message\":\""
+                     << escape_json_string(error.substr(5)) << "\"}";
+                send_json_response(client, json.str(), 409);
+            }
 
         } else if (path == "/api/stop") {
-            if (runner_) {
-                runner_->stop_generation();
+            // Deliberately does NOT take generate_mutex_: it would block on the very
+            // generation it is trying to cancel. Safe because runner_ is only republished
+            // while generate_mutex_ is held, so an in-flight generation is always running
+            // on the currently published runner.
+            auto runner = current_runner();
+            if (runner) {
+                runner->stop_generation();
             }
-            send_json_response(client, "{\"status\":\"SUCCESS\", \"message\":\"Generation stop signal sent.\"}");
+            std::ostringstream json;
+            json << "{\"status\":\"SUCCESS\", \"had_runner\":" << (runner ? "true" : "false")
+                 << ", \"message\":\"Generation stop signal sent.\"}";
+            send_json_response(client, json.str());
 
         } else if (path == "/api/clear_cache") {
-            if (runner_) {
-                runner_->clear_expert_cache();
+            // Clearing mid-generation is benign today (pinned slots survive), but taking
+            // the lock costs two lines and removes the need for anyone to re-derive that.
+            std::unique_lock<std::mutex> gen(generate_mutex_, std::try_to_lock);
+            if (!gen.owns_lock()) {
+                send_json_response(client,
+                    "{\"status\":\"ERROR\", \"message\":\"A generation is in progress.\"}", 409);
+                closesocket(client);
+                return;
+            }
+            auto runner = current_runner();
+            if (runner) {
+                runner->clear_expert_cache();
             }
             send_json_response(client, "{\"status\":\"SUCCESS\", \"message\":\"Expert DRAM Cache pool flushed.\"}");
 
@@ -663,24 +944,45 @@ void HTTPServer::handle_chat_completion(uintptr_t client, const HttpRequest& req
 
     ValidatedChatRequest vr;
     ApiError err;
-    if (!validate_chat_request(body, openai_cfg_, vr, err)) {
+    if (!validate_chat_request(body, openai_config(), vr, err)) {
         send_err(err);
         return;
     }
-    if (!runner_) {
+    if (!current_runner()) {
         send_err({503, "No model is loaded.", "server_error", "", "model_not_loaded"});
         return;
     }
 
     // Admission before tokenization: an over-capacity request should not pay for a prompt it
-    // will never run.
-    if (!coordinator_) {
-        coordinator_ = std::make_unique<RequestCoordinator>(openai_cfg_.queue_limit);
-    }
+    // will never run. coordinator_ is constructed in start(), so it is non-null for the
+    // server's whole lifetime -- it used to be built lazily right here, from a detached
+    // thread, which raced two concurrent first requests.
     auto lease = coordinator_->acquire();
     if (!lease) {
         send_err({429, "Server is at capacity; retry shortly.",
                   "server_error", "", "queue_full"});
+        return;
+    }
+
+    // The generation lock, which this path did NOT take before.
+    //
+    // RequestCoordinator serializes only among /v1 callers, so a /v1 request and an
+    // /api/generate request could run produce_token concurrently on the same runner and the
+    // same GPU scratch buffers -- exactly the corruption generate_mutex_ exists to prevent.
+    //
+    // Blocking, not try_lock: the lease already guarantees at most one /v1 generation, so
+    // this only ever waits on a GUI generation, and the caller opted into queueing by
+    // getting a lease at all. Holding it across the SSE stream is correct -- that stream is
+    // a generation -- and means a reload will 409 for its duration.
+    std::lock_guard<std::mutex> gen(generate_mutex_);
+
+    // Snapshot after locking: a reload may have republished runner_ while this request was
+    // queued for its lease. Taking it here rather than at admission means the request runs
+    // against one consistent runner, though possibly a different model than was loaded when
+    // it was admitted.
+    auto runner = current_runner();
+    if (!runner) {
+        send_err({503, "No model is loaded.", "server_error", "", "model_not_loaded"});
         return;
     }
 
@@ -690,7 +992,7 @@ void HTTPServer::handle_chat_completion(uintptr_t client, const HttpRequest& req
 
     if (!vr.stream) {
         try {
-            auto result = runner_->generate_chat(vr.messages, vr.options);
+            auto result = runner->generate_chat(vr.messages, vr.options);
             send_http_response(client, 200, "application/json",
                                render_completion(id, vr.model, result, created), false);
         } catch (const std::exception& ex) {
@@ -716,7 +1018,7 @@ void HTTPServer::handle_chat_completion(uintptr_t client, const HttpRequest& req
 
     GenerationResult result;
     try {
-        result = runner_->generate_chat(
+        result = runner->generate_chat(
             vr.messages, vr.options,
             [&](const StreamEvent& ev) {
                 const auto now = std::chrono::steady_clock::now();

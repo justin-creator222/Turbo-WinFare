@@ -217,7 +217,7 @@ int main(int argc, char** argv) {
 
     ComputePipelineManager pm(ctx);
     try {
-        pm.initialize_pipelines();
+        pm.initialize_pipelines(gturbo::ComputePipelineManager::kLegacyDescriptorCapacity);
     } catch (const std::exception& ex) {
         std::cout << "  [FAIL] pipeline init: " << ex.what() << "\n";
         return 1;
@@ -231,7 +231,6 @@ int main(int argc, char** argv) {
                    const std::vector<ID3D12Resource*>& uavs,
                    const KernelDispatchParams& p) {
         auto cl = ctx->reset_command_list();
-        pm.reset_descriptor_ring();
         pm.dispatch(cl.Get(), k, srvs, uavs, p);
         cl->Close();
         ID3D12CommandList* lists[] = {cl.Get()};

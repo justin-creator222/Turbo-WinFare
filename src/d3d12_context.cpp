@@ -131,7 +131,8 @@ void D3D12Context::flush_gpu() {
     wait_for_fence(val);
 }
 
-ComPtr<ID3D12Resource> D3D12Context::create_uma_buffer(uint64_t size_bytes, const std::string& name) {
+ComPtr<ID3D12Resource> D3D12Context::create_uma_buffer(uint64_t size_bytes, const std::string& name,
+                                                       bool needs_uav) {
     D3D12_HEAP_PROPERTIES heap_props{};
     heap_props.Type = D3D12_HEAP_TYPE_CUSTOM;
     heap_props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
@@ -148,7 +149,8 @@ ComPtr<ID3D12Resource> D3D12Context::create_uma_buffer(uint64_t size_bytes, cons
     res_desc.SampleDesc.Count = 1;
     res_desc.SampleDesc.Quality = 0;
     res_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    res_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    res_desc.Flags = needs_uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                               : D3D12_RESOURCE_FLAG_NONE;
 
     ComPtr<ID3D12Resource> resource;
     HRESULT hr = device_->CreateCommittedResource(
@@ -161,6 +163,20 @@ ComPtr<ID3D12Resource> D3D12Context::create_uma_buffer(uint64_t size_bytes, cons
     );
 
     if (FAILED(hr)) {
+        // An UPLOAD heap cannot carry ALLOW_UNORDERED_ACCESS, so this fallback is only
+        // sound for buffers that are read and never written by a shader. Downgrading a
+        // UAV-capable request here used to produce a resource that CreateUnorderedAccessView
+        // cannot legally describe -- undefined descriptor, garbage writes, no diagnostic.
+        if (needs_uav) {
+            throw GTurboFormatError(
+                "Failed to allocate a host-coherent UMA buffer of " +
+                std::to_string(size_bytes) + " bytes" +
+                (name.empty() ? std::string() : " for '" + name + "'") +
+                ". This buffer must be shader-writable, so there is no read-only fallback. "
+                "The usual cause is memory pressure from a large expert slot pool -- lower "
+                "--slots.");
+        }
+
         D3D12_HEAP_PROPERTIES upload_props{};
         upload_props.Type = D3D12_HEAP_TYPE_UPLOAD;
 
@@ -183,10 +199,6 @@ ComPtr<ID3D12Resource> D3D12Context::create_uma_buffer(uint64_t size_bytes, cons
         resource->SetName(wname.c_str());
     }
     return resource;
-}
-
-ComPtr<ID3D12Resource> D3D12Context::create_gpu_buffer(uint64_t size_bytes, const std::string& name) {
-    return create_uma_buffer(size_bytes, name);
 }
 
 D3D12Context::SystemMemoryInfo D3D12Context::query_memory_info() const {

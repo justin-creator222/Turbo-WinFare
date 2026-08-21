@@ -200,6 +200,8 @@ reference; in progress, roughly in this order:
 | Real HTTP framing (Content-Length, chunked, 1 MiB limit, 413/415) | **done** -- [src/http.cpp](src/http.cpp) |
 | Tool calling and channel decoding -- note the generation prompt already opens a `thought` channel and **nothing suppresses it** | not started |
 | Runtime integrity verification, symlink rejection | not started |
+| Expert-cache opt-in above 44 slots (descriptor heap derived from slot count) | **done** |
+| GUI/HTTP reload actually applying slots/context | **done** -- `/api/load_model` used to discard them |
 | Chunked/batched prefill (~5.7 tok/s here vs ~28 in the reference) | deferred |
 | FP16 KV and context above 4096 | deferred |
 
@@ -224,6 +226,33 @@ auto-sized expert cache; the breakdown below prints on every CLI run.
 
 Reference points: M2 Air 5.1-6.3 tok/s; our 16-slot config (the 16 GB Legion Go S target)
 reaches **6.54 tok/s**, so the reference is beaten on the constrained configuration too.
+
+### Trading RAM for speed (`--slots`) -- opt-in, defaults unchanged
+
+The auto-size ladder (16/24/32 slots at <=16/<=24/>=32 GB) is deliberately conservative and
+stays that way; raising the cache is an explicit opt-in via `--slots N` or the GUI sidebar
+followed by a model reload. Interleaved, 120 tokens, idle machine:
+
+| slots | pool | peak RSS | cache hit | decode |
+|---|---|---|---|---|
+| 24 (auto here) | 2.3 GB | 4.3 GB | 64.8% | **7.0** |
+| 44 | 4.1 GB | 6.2 GB | 82.7% | **9.2** |
+| 64 | 6.0 GB | ~8.1 GB | 90.3% | 7.8-8.9 |
+
+**~+30% for ~2 GB.** 64 slots is *not* faster despite a 90% hit rate -- the pool competes with
+the OS page cache for the same physical memory, which is also why the ladder stops at 32.
+Footprint is `1.29 GB resident + KV + slots * 30 * 3.2 MB`.
+
+Two ceilings bound it, both now reported at startup rather than later:
+
+- **Descriptor heap.** Derived from the slot count by
+  `ComputePipelineManager::descriptors_for()`. It was hardcoded at 65,536, which fit exactly 44
+  slots and then threw `Descriptor heap exhausted` **mid-generation**, because tables are
+  created lazily as slots are touched. `initialize_pipelines()` takes the capacity as a
+  required argument so the resolve-slots-first ordering cannot be reversed silently.
+- **The adapter's shared-memory budget** (~12.2 GB here, roughly half of installed RAM) is the
+  real cap on UMA allocation, not installed RAM. Overshooting it does not degrade, it fails --
+  and it used to surface as an unrelated-looking `Failed to map ...` far downstream.
 
 **Where the time goes now:** ~34% expert I/O, ~41% GPU wait, ~9% LM head, ~16% CPU. The
 engine is still nowhere near compute- or DRAM-bound (Stage 3 measured 0.2% of peak ALU and
@@ -269,11 +298,42 @@ engine is still nowhere near compute- or DRAM-bound (Stage 3 measured 0.2% of pe
   non-interleaved comparison appeared to show a 15% regression; that was machine drift, not
   the change. See the warning comment in [shaders/Common.hlsli](shaders/Common.hlsli).
 
+**Two measurement traps that have each already produced a confident wrong conclusion.**
+
+1. **Background disk I/O invalidates everything.** An audit once reported a ~40% regression
+   against this file. There was none -- a game download was running. Same binary, same flags,
+   bit-identical workload (38,985 MB in 12,171 reads, 64.78% hit rate both times): 5.07 tok/s
+   contended vs **6.03** idle, I/O throughput 1957 vs **3306 MB/s**. Decode is I/O-bound, so
+   anything touching the NVMe competes directly and also evicts the expert pages the streamer
+   relies on the OS page cache to hold. Check `Get-Counter
+   '\PhysicalDisk(_Total)\Current Disk Queue Length'` reads 0 before believing a number.
+2. **A sequential sweep measures page-cache warmth, not your variable.** Sweeping
+   `--slots 16,24,32,40` in order shows everything getting faster as each run inherits a warmer
+   cache. That artefact turned a real +27% into an apparent +50%. Alternate A/B/A/B for >=3
+   rounds and compare medians: interleaved spread within a config is +/-0.05 tok/s, sequential
+   is over 1 tok/s.
+
+Also **check the exit code** -- a failed run exits non-zero with a diagnostic, but a grep for
+metric lines renders it as an empty row that reads like a slow result rather than a crash.
+
 **Benchmarking note.** Decode measured 8.6-9.0 tok/s earlier in the Stage 4 session and
 7.1-7.9 tok/s later, with bit-identical shader code. Run-to-run drift on this machine is
 larger than most single optimizations, so **compare variants interleaved in one session**, not
 across sessions. The Stage 4 progression table was measured sequentially and its relative
 gains hold, but treat its absolute numbers as one session's snapshot.
+
+### Open: an intermittent crash under repeated back-to-back runs
+
+Twice during one benchmarking loop (out of ~40 runs that session, and also seen before any of
+the recent changes) a CLI run exited **139** with no metrics. Both failures immediately
+followed a run at a *different* `--slots` value. It has not reproduced in 23 consecutive runs
+since, including deliberate stress alternating 64 and 24 slots, so **it is not understood and
+not fixed** -- do not assume a clean benchmark loop means it is gone. If you hit it, capture
+the full stdout+stderr and the exit code rather than a grep of the metric lines.
+
+Suspicion, unconfirmed: allocation pressure when the previous process's multi-GB commitment
+has not been reclaimed yet. Note expert slot buffers are SRV-only and so may fall back to an
+UPLOAD heap (see `create_uma_buffer`), which lets the pool over-commit and fail elsewhere.
 
 ### Not yet done
 
@@ -362,6 +422,36 @@ code computing an expert file offset from the old value read the wrong expert en
 
 `layout.json` describes the nine sub-tensor offsets **once** (`expertBlock`) instead of
 enumerating all 3,840 (layer, expert) pairs; that is why it is 3.4 KB rather than 6.9 MB.
+
+## Bundle path resolution -- the stale placeholder in `build/`
+
+`build/gemma-4-26b-a4b.gturbo` is a 7.2 MB **placeholder** left by the retired repacker. It
+has a `manifest.json` and a `packed_experts/layout.json`, so nothing short of parsing rejects
+it -- its `layout.json` predates the `expertBlock` format and reports
+`expertStride: 88604672`.
+
+Because of it, **a bare bundle name must never be resolved by an existence check.** Use
+`resolve_bundle_path()` ([src/manifest.cpp](src/manifest.cpp)), which validates each
+candidate with `bundle_loads()` and searches the working directory, then the executable's
+directory, then one level up. An explicit path (absolute, or containing a separator) is taken
+literally.
+
+This bit once already: `/api/load_model` took the GUI's raw `"gemma-4-26b-a4b.gturbo"` and
+resolved it against the working directory. Launched from `build/` -- which is what
+double-clicking does -- startup loaded the real bundle (it resolved properly) while a reload
+loaded the placeholder and failed with `layout: missing required field 'expertBlock'`.
+`/api/models` had the same flaw and offered the placeholder in the dropdown.
+
+Two consequences worth keeping:
+
+- `/api/models` lists only bundles that actually parse, across every search root, and
+  compares `is_active` on **canonicalized** paths -- the runner stores an absolute path while
+  the list emits a bare name, so a string `==` never matched and left the architecture fields
+  null.
+- `swap_runner` parses and cross-validates the new bundle **before** releasing the old
+  runner. The release-first ordering exists so two models are never committed at once
+  (2 x 12.9 GB at 128 slots), but without the up-front validation a mistyped path destroyed a
+  perfectly good loaded model.
 
 ## Published documentation
 

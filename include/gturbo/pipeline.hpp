@@ -56,7 +56,38 @@ public:
     explicit ComputePipelineManager(std::shared_ptr<D3D12Context> ctx);
     ~ComputePipelineManager();
 
-    void initialize_pipelines();
+    // `descriptor_capacity` MUST come from descriptors_for() with the resolved expert slot
+    // count. It is a required argument, not a default, because the capacity depends on a
+    // value (expert_slots_per_layer_) that ForwardRunner::initialize() used to resolve
+    // *after* building this object -- so the dependency is enforced by the compiler rather
+    // than by a comment someone can reorder past.
+    void initialize_pipelines(uint32_t descriptor_capacity);
+
+    // Descriptor budget for a whole generation.
+    //
+    // Every dispatch whose exact resource set has not been seen before burns 16 descriptors
+    // (8 SRV + 8 UAV, see dispatch()), and tables are NEVER recycled -- so this is a
+    // cumulative total for the process, not a per-token working set. Distinct binding sets:
+    //
+    //   3 per (layer, expert slot)  -- expert_gemv gate/up/down, src/runner.cpp
+    //   3 per layer                 -- k epilogue, v epilogue, Attention (per-layer KV bufs)
+    //   <= 64 layer-invariant       -- embed, norms, router, GeGLU, PostAttn, LayerTail, head
+    //
+    // The expert term dominates: at 30 layers it is 90 sets per slot. A hardcoded 65536
+    // capped `--slots` at 44, and because tables are created lazily as slots are touched,
+    // breaching it threw MID-GENERATION rather than at startup.
+    static uint32_t descriptors_for(size_t slots_per_layer, int num_layers);
+
+    // Largest slot count whose descriptor budget fits in `capacity` -- the inverse of
+    // descriptors_for(), used to tell the user what they can actually ask for.
+    static size_t max_slots_for_capacity(uint32_t capacity, int num_layers);
+
+    // A shader-visible CBV/SRV/UAV heap is capped at 1,000,000 descriptors on resource
+    // binding tier 1 and 2; tier 3 is limited only by memory.
+    static constexpr uint32_t kMaxShaderVisibleDescriptors = 1000000;
+    // Kept as the floor so small configurations, and the tests that pass it explicitly,
+    // allocate exactly what they always did.
+    static constexpr uint32_t kLegacyDescriptorCapacity = 65536;
 
     ComPtr<ID3D12RootSignature> root_signature() const { return root_signature_; }
     ComPtr<ID3D12PipelineState> get_pipeline(KernelType type) const;
@@ -74,10 +105,14 @@ public:
     static void barrier(ID3D12GraphicsCommandList* cmd_list,
                         const std::vector<ID3D12Resource*>& resources);
 
-    // No-op now that descriptor tables are cached for the heap's lifetime; kept so callers
-    // do not have to care. Tables are never recycled, so nothing can be overwritten while a
-    // command list still references it.
-    void reset_descriptor_ring() {}
+    // Descriptor heap occupancy. Tables are cached for the heap's lifetime and never
+    // recycled, so `descriptors_used` only ever grows -- it is the number to watch if a
+    // future change starts binding per-slot resources the descriptors_for() formula does
+    // not account for. Surfaced in /api/telemetry so that drift is visible before it is
+    // fatal.
+    uint32_t descriptors_used() const { return current_heap_offset_; }
+    uint32_t descriptor_capacity() const { return heap_capacity_; }
+    size_t distinct_binding_sets() const { return table_cache_.size(); }
 
     double descriptor_cache_hit_rate() const {
         const uint64_t total = table_hits_ + table_misses_;
@@ -85,7 +120,7 @@ public:
     }
 
 private:
-    void create_root_signature();
+    void create_root_signature(uint32_t descriptor_capacity);
     ComPtr<ID3DBlob> compile_hlsl(const std::string& hlsl_source,
                                   const std::string& entry_point = "main");
 

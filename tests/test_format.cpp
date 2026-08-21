@@ -174,7 +174,7 @@ int main() {
         std::cout << "  [PASS] D3D12 Context initialized on: " << dummy_ctx->adapter_name() << "\n";
         
         gturbo::ComputePipelineManager pipeline_mgr(dummy_ctx);
-        pipeline_mgr.initialize_pipelines();
+        pipeline_mgr.initialize_pipelines(gturbo::ComputePipelineManager::kLegacyDescriptorCapacity);
         std::cout << "  [PASS] Compute shader pipelines initialized.\n";
     } catch (const std::exception& ex) {
         std::cout << "  [NOTE] GPU compute test skipped: " << ex.what() << "\n";

@@ -38,7 +38,9 @@ void ExpertStreamer::initialize() {
     for (size_t i = 0; i < slot_count_; ++i) {
         auto slot = std::make_unique<ExpertSlot>();
         std::string name = "ExpertSlot_" + std::to_string(i);
-        slot->buffer = ctx_->create_uma_buffer(expert_stride_, name);
+        // Read-only: expert weights are only ever bound as SRVs (GemvInt4 takes the slot as
+        // t0/t1/t2). So this one may fall back to an UPLOAD heap under memory pressure.
+        slot->buffer = ctx_->create_uma_buffer(expert_stride_, name, /*needs_uav=*/false);
         
         void* ptr = nullptr;
         D3D12_RANGE read_range{0, 0};

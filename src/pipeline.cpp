@@ -164,15 +164,71 @@ ComputePipelineManager::ComputePipelineManager(std::shared_ptr<D3D12Context> ctx
 
 ComputePipelineManager::~ComputePipelineManager() {}
 
-void ComputePipelineManager::create_root_signature() {
-    heap_capacity_ = 65536;
+// Distinct binding sets consumed by a full generation. See the comment on descriptors_for()
+// in pipeline.hpp for where each term comes from. Kept as a separate helper so the test can
+// assert the raw formula against the padded capacity.
+// This is the COUNTED number of sets, carrying no safety margin -- all padding lives in
+// descriptors_for(). Keeping the two separate is what lets max_slots_for_capacity() answer
+// "what will actually run" without being needlessly pessimistic, and lets the test pin the
+// historical 65536-descriptor boundary at exactly 44 slots.
+static uint64_t binding_sets_for(size_t slots_per_layer, int num_layers) {
+    const uint64_t L = static_cast<uint64_t>(num_layers < 0 ? 0 : num_layers);
+    const uint64_t S = static_cast<uint64_t>(slots_per_layer);
+    return 3ULL * L * S     // expert gate/up/down, one set per (layer, slot)
+         + 3ULL * L         // k epilogue, v epilogue, Attention -- per-layer KV buffers
+         + 20ULL;           // layer-invariant sets, counted from the dispatch graph
+}
+
+uint32_t ComputePipelineManager::descriptors_for(size_t slots_per_layer, int num_layers) {
+    const uint64_t exact = binding_sets_for(slots_per_layer, num_layers) * 16ULL;
+    // 25% headroom absorbs a modest amount of formula drift -- a new dispatch shape, an
+    // extra scratch buffer -- without silently running out mid-generation.
+    uint64_t padded = exact + exact / 4ULL;
+    // Round up to a whole 4096 so the number reads sensibly in a diagnostic.
+    padded = ((padded + 4095ULL) / 4096ULL) * 4096ULL;
+    if (padded < kLegacyDescriptorCapacity) padded = kLegacyDescriptorCapacity;
+    if (padded > kMaxShaderVisibleDescriptors) padded = kMaxShaderVisibleDescriptors;
+    return static_cast<uint32_t>(padded);
+}
+
+size_t ComputePipelineManager::max_slots_for_capacity(uint32_t capacity, int num_layers) {
+    if (num_layers <= 0) return 0;
+    // Invert descriptors_for() by search rather than algebra: the padding, the 4096
+    // rounding and the floor make a closed form easy to get subtly wrong, and this runs
+    // once, only on the failure path.
+    size_t best = 0;
+    for (size_t s = 1; s <= 4096; ++s) {
+        if (binding_sets_for(s, num_layers) * 16ULL <= static_cast<uint64_t>(capacity)) {
+            best = s;
+        } else {
+            break;
+        }
+    }
+    return best;
+}
+
+void ComputePipelineManager::create_root_signature(uint32_t descriptor_capacity) {
+    heap_capacity_ = descriptor_capacity;
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heap_desc.NumDescriptors = heap_capacity_;
     heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     HRESULT hr_heap = ctx_->device()->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&descriptor_heap_));
     if (FAILED(hr_heap)) {
-        throw GTurboFormatError("Failed to create Shader Visible Descriptor Heap");
+        // Report what the device would actually accept, and what that means in the units the
+        // user controls (--slots), rather than a bare HRESULT. The engine never queried the
+        // binding tier before, so the limit was pure guesswork.
+        D3D12_FEATURE_DATA_D3D12_OPTIONS opts{};
+        std::string tier = "unknown";
+        if (SUCCEEDED(ctx_->device()->CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS, &opts, sizeof(opts)))) {
+            tier = std::to_string(static_cast<int>(opts.ResourceBindingTier));
+        }
+        throw GTurboFormatError(
+            "Failed to create a shader-visible CBV/SRV/UAV descriptor heap of " +
+            std::to_string(heap_capacity_) + " descriptors (resource binding tier " + tier +
+            "). This capacity is derived from the expert slot count; lower --slots and "
+            "retry.");
     }
     descriptor_handle_size_ = ctx_->device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
@@ -254,8 +310,8 @@ ComPtr<ID3DBlob> ComputePipelineManager::compile_hlsl(const std::string& raw_sou
     return DxcCompiler::instance().compile(prepended_source, entry_point, "cs_6_6");
 }
 
-void ComputePipelineManager::initialize_pipelines() {
-    create_root_signature();
+void ComputePipelineManager::initialize_pipelines(uint32_t descriptor_capacity) {
+    create_root_signature(descriptor_capacity);
 
     // Only kernels that are actually implemented are listed. Missing entries surface as a
     // clear "no pipeline for kernel" error at dispatch rather than a silent no-op.
@@ -392,9 +448,18 @@ void ComputePipelineManager::dispatch(ID3D12GraphicsCommandList* cmd_list,
         ++table_hits_;
     } else {
         if (current_heap_offset_ + SRV_SLOTS + UAV_SLOTS > heap_capacity_) {
+            // Unreachable by construction: the capacity is derived from the resolved slot
+            // count via descriptors_for(), with headroom. If it ever fires, the formula has
+            // drifted from what the dispatch graph actually binds -- so say by how much,
+            // rather than "raise heap_capacity_", which is no longer where the number
+            // comes from.
             throw GTurboFormatError(
-                "Descriptor heap exhausted: " + std::to_string(table_cache_.size()) +
-                " distinct binding sets exceed the heap. Raise heap_capacity_.");
+                "Descriptor heap exhausted after " + std::to_string(table_cache_.size()) +
+                " distinct binding sets (" + std::to_string(current_heap_offset_) + " of " +
+                std::to_string(heap_capacity_) + " descriptors used). The capacity is "
+                "derived from the expert slot count by "
+                "ComputePipelineManager::descriptors_for(); this means the dispatch graph "
+                "now binds more distinct resource sets than that formula predicts.");
         }
 
         auto handle_at = [&](uint32_t slot) {

@@ -22,7 +22,63 @@ ForwardRunner::ForwardRunner(std::shared_ptr<D3D12Context> ctx,
                              const std::string& model_dir)
     : ctx_(ctx), manifest_(manifest), layout_(layout), model_dir_(model_dir) {}
 
-ForwardRunner::~ForwardRunner() {}
+ForwardRunner::~ForwardRunner() {
+    // Every buffer this object owns -- resident weights, KV cache, activations, expert slots
+    // -- may still be referenced by a command list the GPU has not finished executing. The
+    // D3D12Context, and therefore the command queue, is SHARED and outlives the runner, so
+    // releasing those resources without draining first is a device removal.
+    //
+    // This belongs in the destructor rather than at each call site: the server reload path,
+    // /api/unload_model and the C ABI's load/unload all destroy runners, and remembering the
+    // flush at three of those and forgetting the fourth is exactly how this goes wrong.
+    if (ctx_) {
+        try {
+            ctx_->flush_gpu();
+        } catch (...) {
+            // A destructor must not throw. A failed flush here means the device is already
+            // lost, in which case there is nothing left to drain.
+        }
+    }
+}
+
+// Size the expert cache. Pure logic, deliberately free of D3D12 and of the model bundle so
+// the ladder and its bounds can be tested directly -- reaching this through initialize()
+// would require a tokenizer, a device, resident.bin and 30 layer files.
+//
+// Bigger is NOT automatically better: the slot pool competes with the OS page cache for the
+// same physical memory, which is why the ladder stops well short of the 128 experts a layer
+// has. Raising it is an opt-in, not a default.
+size_t ForwardRunner::resolve_slots(size_t requested, uint64_t total_ram_bytes,
+                                    int top_k_experts, int num_experts) {
+    size_t slots;
+    if (requested > 0) {
+        slots = requested;
+    } else {
+        // A zero here means "no device to ask"; assume the low tier rather than the high one.
+        const double ram_gb = total_ram_bytes > 0
+            ? static_cast<double>(total_ram_bytes) / (1024.0 * 1024.0 * 1024.0)
+            : 16.0;
+        if      (ram_gb >= 30.0) slots = 32;
+        else if (ram_gb >= 22.0) slots = 24;
+        else                     slots = 16;
+    }
+
+    // A pool larger than the expert count can never fill. Lossless to clamp.
+    if (num_experts > 0 && slots > static_cast<size_t>(num_experts)) {
+        slots = static_cast<size_t>(num_experts);
+    }
+
+    // Hard error, not a clamp: the pool must strictly exceed the routed batch so
+    // plan_experts always has an unpinned slot to evict. Below that, eviction deadlocks.
+    const size_t min_slots = static_cast<size_t>(top_k_experts) + 1;
+    if (slots < min_slots) {
+        throw GTurboFormatError(
+            "Expert slot pool of " + std::to_string(slots) +
+            " must exceed top_k_experts (" + std::to_string(top_k_experts) + "). Use at "
+            "least --slots " + std::to_string(min_slots) + ".");
+    }
+    return slots;
+}
 
 void ForwardRunner::initialize() {
     // The tokenizer is a hard dependency: the reference bundle ships tokenizer/tokenizer.json
@@ -46,38 +102,69 @@ void ForwardRunner::initialize() {
     }
     tokenizer_.load_vocabulary(vocab_path);
 
-    pipeline_mgr_ = std::make_unique<ComputePipelineManager>(ctx_);
-    pipeline_mgr_->initialize_pipelines();
-
     const auto& arch = manifest_.arch;
 
-    // Size the expert cache from installed RAM.
+    // Resolve the expert cache size FIRST -- before the pipeline manager exists.
     //
-    // Bigger is NOT automatically better: the slot pool competes with the OS page cache for
-    // the same physical memory, and the reference measured 32 slots collapsing their 8 GB
-    // host from 5.6 to 1.578 tok/s with I/O rising to 318 ms/token
-    // (docs/experiments/summaries/03-...#cache-03). The pool must also strictly exceed
-    // top_k_experts so a batch always has an unpinned slot to evict.
-    if (requested_slots_ > 0) {
-        expert_slots_per_layer_ = requested_slots_;
-    } else {
-        const double ram_gb = ctx_
-            ? static_cast<double>(ctx_->query_memory_info().total_system_ram_bytes) / (1024.0 * 1024.0 * 1024.0)
-            : 16.0;
-        if      (ram_gb >= 30.0) expert_slots_per_layer_ = 32;
-        else if (ram_gb >= 22.0) expert_slots_per_layer_ = 24;
-        else                     expert_slots_per_layer_ = 16;
+    // The descriptor heap capacity is a function of this number (see
+    // ComputePipelineManager::descriptors_for), so resolving it afterwards is what capped
+    // --slots at 44 and made the breach surface mid-generation. initialize_pipelines() now
+    // takes the capacity as a required argument, so this ordering cannot be reversed
+    // without a compile error.
+    const D3D12Context::SystemMemoryInfo mem =
+        ctx_ ? ctx_->query_memory_info() : D3D12Context::SystemMemoryInfo{};
+    expert_slots_per_layer_ = resolve_slots(requested_slots_, mem.total_system_ram_bytes,
+                                            arch.top_k_experts, arch.num_experts);
+
+    if (requested_slots_ > static_cast<size_t>(arch.num_experts)) {
+        // Clamped rather than rejected: a pool larger than the expert count can never fill,
+        // so honouring it would only waste memory. That is lossless to correct on the user's
+        // behalf, unlike the top_k floor below, which deadlocks eviction and stays an error.
+        std::cout << "      Note: --slots " << requested_slots_ << " exceeds the "
+                  << arch.num_experts << " experts per layer; using "
+                  << expert_slots_per_layer_ << ".\n";
     }
-    const size_t min_slots = static_cast<size_t>(arch.top_k_experts) + 1;
-    if (expert_slots_per_layer_ < min_slots) {
-        throw GTurboFormatError(
-            "Expert slot pool of " + std::to_string(expert_slots_per_layer_) +
-            " must exceed top_k_experts (" + std::to_string(arch.top_k_experts) + ").");
-    }
+
+    const uint64_t pool_bytes = static_cast<uint64_t>(expert_slots_per_layer_) *
+                                manifest_.expert_stride *
+                                static_cast<uint64_t>(arch.num_layers);
     std::cout << "      Expert cache: " << expert_slots_per_layer_ << " slots/layer ("
-              << (expert_slots_per_layer_ * manifest_.expert_stride * arch.num_layers
-                  / (1024 * 1024))
+              << (pool_bytes / (1024 * 1024))
               << " MB if every layer opens)\n";
+
+    // Warn, do not block. Streamers open lazily so the pool is never committed all at once,
+    // and an explicit --slots is an opt-in -- but there are two distinct ceilings here and
+    // neither announces itself clearly when breached.
+    //
+    // 1. Available system RAM. The slot pool competes with the OS page cache for the same
+    //    physical memory, and the streamer leans on that cache deliberately. The reference
+    //    measured 32 slots collapsing their 8 GB host from 5.6 to 1.578 tok/s with I/O
+    //    rising to 318 ms/token -- so overshooting here makes things slower, not faster.
+    //
+    // 2. The adapter's shared-system-memory budget, which is the real cap on UMA
+    //    allocation and is typically about half of installed RAM. Overshooting THIS does
+    //    not degrade, it fails -- and it surfaces far downstream as an unrelated-looking
+    //    "Failed to map ..." rather than as an allocation error.
+    const uint64_t shared_budget = ctx_ ? ctx_->shared_system_memory() : 0;
+    // Everything else the engine commits to UMA: resident weights, KV cache, activations.
+    // Approximate, and deliberately on the low side so this warns rather than nags.
+    constexpr uint64_t kOtherUmaBytes = 2ULL * 1024 * 1024 * 1024;
+    if (shared_budget > 0 && pool_bytes + kOtherUmaBytes > shared_budget) {
+        std::cout << "      WARNING: a " << (pool_bytes / (1024 * 1024))
+                  << " MB pool plus resident weights and KV cache will not fit the adapter's "
+                  << (shared_budget / (1024 * 1024))
+                  << " MB shared-memory budget. Allocation is likely to fail partway through "
+                     "loading. Lower --slots.\n";
+    } else if (mem.avail_system_ram_bytes > 0 && pool_bytes > mem.avail_system_ram_bytes) {
+        std::cout << "      WARNING: that pool exceeds available RAM ("
+                  << (mem.avail_system_ram_bytes / (1024 * 1024))
+                  << " MB free). Expect the OS page cache to be squeezed and expert I/O to "
+                     "get slower, not faster. Lower --slots if throughput drops.\n";
+    }
+
+    pipeline_mgr_ = std::make_unique<ComputePipelineManager>(ctx_);
+    pipeline_mgr_->initialize_pipelines(
+        ComputePipelineManager::descriptors_for(expert_slots_per_layer_, arch.num_layers));
 
     // Lazy vector for per-layer Expert Streamers (slots allocated on demand)
     streamers_.resize(arch.num_layers);
@@ -169,7 +256,9 @@ void ForwardRunner::initialize() {
                                 std::to_string(GTurboFormatV1::RESIDENT_HEADER_BYTES) + ")");
     }
 
-    buf_resident_weights_ = ctx_->create_uma_buffer(file_size, "resident_weights");
+    // Read-only: resident weights are always bound as an SRV, never written by a shader.
+    buf_resident_weights_ = ctx_->create_uma_buffer(file_size, "resident_weights",
+                                                    /*needs_uav=*/false);
     std::ifstream file(resident_bin_path, std::ios::binary);
     if (!file.is_open()) {
         throw GTurboFormatError("Failed to open " + resident_bin_path);
@@ -309,10 +398,11 @@ uint32_t ForwardRunner::produce_token(uint32_t input_token, int position,
         return std::chrono::duration<double, std::milli>(clock::now() - t).count();
     };
 
-    // Descriptors are consumed linearly and must not be recycled while a list referencing
-    // them is in flight. One token needs ~28.4k of the 65.5k heap, so the ring is reset once
-    // per token rather than once per submission.
-    pipeline_mgr_->reset_descriptor_ring();
+    // Descriptor tables are cached for the process lifetime and never recycled -- a table
+    // must not be overwritten while a command list referencing it is still in flight, and
+    // there is no per-descriptor fence tracking to make that safe. The heap is sized up
+    // front for the whole run by ComputePipelineManager::descriptors_for(), so nothing is
+    // reset per token.
 
     ComPtr<ID3D12GraphicsCommandList> cl;
     auto begin = [&]() { cl = ctx_->reset_command_list(); };
@@ -483,12 +573,19 @@ uint32_t ForwardRunner::produce_token(uint32_t input_token, int position,
             void* p = nullptr;
             D3D12_RANGE r{0, K * sizeof(uint32_t)};
             if (FAILED(buf_router_indices_->Map(0, &r, &p)) || !p) {
-                throw GTurboFormatError("Failed to map router indices for readback");
+                throw GTurboFormatError(
+                    "Failed to map router indices for readback."
+                    " A Map failure here almost always means the UMA/shared-memory budget is"
+                    " exhausted rather than anything wrong with the buffer itself -- lower"
+                    " --slots or --context.");
             }
             std::memcpy(top_idx.data(), p, K * sizeof(uint32_t));
             buf_router_indices_->Unmap(0, nullptr);
         }
         if (L == 0) {
+            // Telemetry reads this from another thread; a vector::assign racing a
+            // copy-construct is a genuine data race, not merely a torn integer.
+            std::lock_guard<std::mutex> guard(active_experts_mutex_);
             last_active_experts_.assign(top_idx.begin(), top_idx.end());
         }
 
@@ -663,7 +760,11 @@ uint32_t ForwardRunner::produce_token(uint32_t input_token, int position,
         void* p = nullptr;
         D3D12_RANGE r{0, sizeof(uint32_t)};
         if (FAILED(buf_out_token_->Map(0, &r, &p)) || !p) {
-            throw GTurboFormatError("Failed to map output token for readback");
+            throw GTurboFormatError(
+                    "Failed to map output token for readback."
+                    " A Map failure here almost always means the UMA/shared-memory budget is"
+                    " exhausted rather than anything wrong with the buffer itself -- lower"
+                    " --slots or --context.");
         }
         best_id = *static_cast<const uint32_t*>(p);
         buf_out_token_->Unmap(0, nullptr);
@@ -685,7 +786,11 @@ uint32_t ForwardRunner::produce_token(uint32_t input_token, int position,
             void* p = nullptr;
             D3D12_RANGE r{0, static_cast<size_t>(V) * 4};
             if (FAILED(buf_logits_->Map(0, &r, &p)) || !p) {
-                throw GTurboFormatError("Failed to map logits for readback");
+                throw GTurboFormatError(
+                    "Failed to map logits for readback."
+                    " A Map failure here almost always means the UMA/shared-memory budget is"
+                    " exhausted rather than anything wrong with the buffer itself -- lower"
+                    " --slots or --context.");
             }
             std::memcpy(logits_scratch_.data(), p, static_cast<size_t>(V) * 4);
             buf_logits_->Unmap(0, nullptr);
@@ -964,6 +1069,7 @@ void ForwardRunner::set_eviction_policy(EvictionPolicy policy) {
 }
 
 std::vector<int> ForwardRunner::last_active_experts() const {
+    std::lock_guard<std::mutex> guard(active_experts_mutex_);
     return last_active_experts_;
 }
 

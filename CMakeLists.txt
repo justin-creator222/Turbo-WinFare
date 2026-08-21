@@ -57,6 +57,11 @@ target_link_libraries(test_gpu_kernels PRIVATE turbo_engine_lib)
 add_executable(test_streamer tests/test_streamer.cpp)
 target_link_libraries(test_streamer PRIVATE turbo_engine_lib)
 
+# Capacity planning: descriptor budget and the expert-slot sizing ladder. Pure logic --
+# no GPU, no model bundle. Guards the ceiling that used to cap --slots at 44.
+add_executable(test_capacity tests/test_capacity.cpp)
+target_link_libraries(test_capacity PRIVATE turbo_engine_lib)
+
 # Sampling: truncation order, seeding, repetition penalty. Shared by both paths. No GPU.
 add_executable(test_sampling tests/test_sampling.cpp)
 target_link_libraries(test_sampling PRIVATE turbo_engine_lib)
@@ -78,6 +83,7 @@ add_test(NAME test_format COMMAND test_format)
 add_test(NAME test_tokenizer COMMAND test_tokenizer)
 add_test(NAME test_gpu_kernels COMMAND test_gpu_kernels)
 add_test(NAME test_streamer COMMAND test_streamer)
+add_test(NAME test_capacity COMMAND test_capacity)
 add_test(NAME test_sampling COMMAND test_sampling)
 add_test(NAME test_detokenizer COMMAND test_detokenizer)
 add_test(NAME test_server COMMAND test_server)
@@ -98,6 +104,7 @@ if (MINGW)
     target_link_options(test_gpu_kernels PRIVATE -static-libgcc -static-libstdc++)
     target_link_options(test_tokenizer PRIVATE -static-libgcc -static-libstdc++)
     target_link_options(test_streamer PRIVATE -static-libgcc -static-libstdc++)
+    target_link_options(test_capacity PRIVATE -static-libgcc -static-libstdc++)
     target_link_options(test_sampling PRIVATE -static-libgcc -static-libstdc++)
     target_link_options(test_detokenizer PRIVATE -static-libgcc -static-libstdc++)
     target_link_options(test_server PRIVATE -static-libgcc -static-libstdc++)

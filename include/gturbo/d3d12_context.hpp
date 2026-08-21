@@ -38,9 +38,20 @@ public:
     void wait_for_fence(uint64_t fence_value);
     void flush_gpu();
 
-    // Memory Allocation Helper for UMA Host-Coherent RAM
-    ComPtr<ID3D12Resource> create_uma_buffer(uint64_t size_bytes, const std::string& name = "");
-    ComPtr<ID3D12Resource> create_gpu_buffer(uint64_t size_bytes, const std::string& name = "");
+    // Memory Allocation Helper for UMA Host-Coherent RAM.
+    //
+    // `needs_uav` must be true for any buffer a shader will WRITE. It defaults to true
+    // because that is the overwhelming majority here and because the failure mode of
+    // getting it wrong is silent.
+    //
+    // When the host-coherent CUSTOM/L0 allocation fails -- which is exactly what memory
+    // pressure from a large expert slot pool provokes -- there is a fallback onto an UPLOAD
+    // heap. An UPLOAD-heap resource cannot carry ALLOW_UNORDERED_ACCESS, so creating a UAV
+    // over one is an invalid call that, with the debug layer off, yields an undefined
+    // descriptor and garbage writes rather than an error. So the fallback is offered ONLY
+    // for read-only buffers; a UAV-capable request fails loudly instead of downgrading.
+    ComPtr<ID3D12Resource> create_uma_buffer(uint64_t size_bytes, const std::string& name = "",
+                                             bool needs_uav = true);
 
     std::string adapter_name() const { return adapter_name_; }
     uint64_t dedicated_video_memory() const { return dedicated_vram_; }

@@ -1,9 +1,14 @@
 #include "gturbo/manifest.hpp"
+#include "gturbo/packed_experts.hpp"
 #include "gturbo/json.hpp"
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
 #include <fstream>
+#include <filesystem>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace gturbo {
 
@@ -238,6 +243,66 @@ GTurboManifestV1 GTurboManifestV1::from_json_string(const std::string& json_str)
 
     m.validate();
     return m;
+}
+
+bool bundle_loads(const std::string& dir) {
+    try {
+        auto manifest = GTurboManifestV1::from_json_string(read_text_file(dir + "/manifest.json"));
+        auto layout = PackedExpertsLayoutV1::from_json_string(
+            read_text_file(dir + "/packed_experts/layout.json"));
+        layout.cross_validate(manifest);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+std::vector<std::string> bundle_search_roots() {
+    namespace fs = std::filesystem;
+    std::vector<std::string> roots;
+    std::error_code ec;
+
+    const fs::path cwd = fs::current_path(ec);
+    if (!ec) roots.push_back(cwd.string());
+
+#ifdef _WIN32
+    wchar_t exe_buf[MAX_PATH]{};
+    if (GetModuleFileNameW(nullptr, exe_buf, MAX_PATH) > 0) {
+        const fs::path exe_dir = fs::path(exe_buf).parent_path();
+        roots.push_back(exe_dir.string());
+        roots.push_back(exe_dir.parent_path().string());
+    }
+#endif
+
+    // De-duplicate; running from build/ makes the first two identical.
+    std::vector<std::string> unique;
+    for (const auto& r : roots) {
+        if (r.empty()) continue;
+        bool seen = false;
+        for (const auto& u : unique) seen = seen || (u == r);
+        if (!seen) unique.push_back(r);
+    }
+    return unique;
+}
+
+std::string resolve_bundle_path(const std::string& name_or_path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+
+    // An explicit path is taken literally, exactly as the CLI's --model is.
+    const bool explicit_path =
+        name_or_path.find('/') != std::string::npos ||
+        name_or_path.find('\\') != std::string::npos ||
+        fs::path(name_or_path).is_absolute();
+    if (explicit_path) return name_or_path;
+
+    for (const auto& root : bundle_search_roots()) {
+        const fs::path candidate = fs::path(root) / name_or_path;
+        if (fs::is_directory(candidate, ec) && bundle_loads(candidate.string())) {
+            return candidate.string();
+        }
+    }
+    return name_or_path;
 }
 
 } // namespace gturbo

@@ -29,19 +29,64 @@ function hydrateConfig() {
             setValue('cfg-maxtoks', c.max_tokens);
             setValue('cfg-slots', c.slots);
             setValue('cfg-eviction', c.eviction_policy);
-            // The engine may run a context the dropdown does not list (it auto-sizes from
-            // installed RAM). Add the real value rather than silently snapping to a listed one.
-            const ctxSel = document.getElementById('cfg-context');
-            if (c.context_len && !Array.from(ctxSel.options).some(o => +o.value === c.context_len)) {
-                const opt = document.createElement('option');
-                opt.value = c.context_len;
-                opt.innerText = `${c.context_len} Tokens`;
-                ctxSel.appendChild(opt);
-            }
+            applyContextBounds(c.context_max, c.context_len);
             setValue('cfg-context', c.context_len);
+            // The banner reflects the engine's own view of whether a reload is outstanding,
+            // rather than lingering from whatever the last slider drag happened to report.
+            showReloadNotice(!!c.reload_pending);
+            applySlotBounds();
             renderConfigLabels();
         })
         .catch(err => console.warn('Config hydrate failed:', err));
+}
+
+// Rebuilds the context dropdown from the ceiling the engine reports (`context_max`,
+// ATTN_MAX_SPAN -- requesting more than it throws at load), so the list can never offer a
+// value that fails to initialize, and it widens on its own if that kernel limit is ever
+// raised. `live` is the engine's current context: it auto-sizes from installed RAM and may
+// land on a value the ladder does not contain, so it is added rather than silently snapped
+// to a listed one.
+function applyContextBounds(maxContext, live) {
+    const sel = document.getElementById('cfg-context');
+    if (!sel) return;
+    const ceiling = maxContext || 4096;
+    const ladder = [512, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768];
+    const values = ladder.filter(v => v <= ceiling);
+    if (!values.includes(ceiling)) values.push(ceiling);
+    if (live && !values.includes(live) && live <= ceiling) values.push(live);
+    values.sort((a, b) => a - b);
+
+    const previous = +sel.value;
+    sel.innerHTML = '';
+    for (const v of values) {
+        const opt = document.createElement('option');
+        opt.value = v;
+        opt.innerText = `${v} Tokens`;
+        sel.appendChild(opt);
+    }
+    // Keep whatever was selected if it survived the rebuild; otherwise fall back to the
+    // engine's live value rather than to the first entry.
+    sel.value = values.includes(previous) ? previous
+              : (values.includes(live) ? live : values[values.length - 1]);
+}
+
+// The slots slider used to be a hardcoded min=1 max=32. Both ends were wrong: 1..8 are
+// below the engine's hard floor of top_k + 1 and would throw on load, and 32 sat well under
+// what the descriptor heap now allows. Drive both ends off the loaded model instead.
+function applySlotBounds() {
+    fetch('/api/models')
+        .then(r => r.json())
+        .then(data => {
+            const active = (data.models || []).find(m => m.top_k !== null && m.experts !== null);
+            const slider = document.getElementById('cfg-slots');
+            if (!slider || !active) return;
+            slider.min = active.top_k + 1;
+            slider.max = active.experts;
+            if (+slider.value < +slider.min) slider.value = slider.min;
+            if (+slider.value > +slider.max) slider.value = slider.max;
+            renderConfigLabels();
+        })
+        .catch(() => { /* leave the HTML defaults in place */ });
 }
 
 function setValue(id, value) {
@@ -206,6 +251,11 @@ function loadSelectedModel() {
             document.getElementById('meta-id').innerText = modelPath.replace('.gturbo', '');
             refreshModelList();
             fetchTelemetry();
+            // Re-read the resolved configuration. The reload now genuinely applies the
+            // requested slots/context, and the engine may still have clamped them -- so show
+            // what it settled on rather than what was asked for. This also clears the reload
+            // banner, which used to stay up after the very reload that satisfied it.
+            hydrateConfig();
         } else {
             alert('Failed to load model: ' + (data.message || 'Unknown error'));
         }
@@ -227,18 +277,25 @@ function usePreset(promptText) {
     sendPrompt();
 }
 
+const SYSTEM_PRESETS = {
+    default: 'You are a helpful, knowledgeable assistant. Answer the question that was asked, directly and without preamble. Match length to the question: one sentence when that is enough, more when the topic needs it. If you do not know something or are uncertain, say so plainly instead of guessing.',
+    code: 'You are an experienced software engineer. Give complete, runnable code: real imports, error paths handled, no placeholder comments standing in for logic. State the language version and any assumptions you made. Prefer the clear solution over the clever one. When reviewing or explaining existing code, describe what it actually does before suggesting changes, and flag bugs and edge cases you notice along the way.',
+    explain: 'You explain technical subjects to a competent reader who is new to this particular topic. Lead with the core idea in plain language, then add the mechanism and the details that matter. Use concrete examples and numbers over analogies. Define a term the first time you use it. Say explicitly where your explanation simplifies something, and where the real behavior differs.',
+    creative: 'You are a skilled creative writer. Write with concrete, specific detail and a distinct voice. Avoid cliche, filler adjectives, and tidy closing morals. Follow the requested form, length, and tone exactly. When a brief is vague, make a specific choice and commit to it rather than hedging across several options.',
+    // Empty on purpose: sendPrompt() omits the system message entirely when the box is
+    // blank, so this is the only setting that costs zero prefill tokens. With no prompt
+    // cache, the system prompt is re-prefilled every turn, so that is worth ~10s of
+    // time-to-first-token on every message.
+    none: '',
+};
+
 function applySystemPreset() {
     const preset = document.getElementById('sys-preset-select').value;
     const input = document.getElementById('sys-prompt-input');
-    if (preset === 'cpp') {
-        input.value = 'You are an expert C++23 and HLSL DirectCompute graphics engineer specialized in wave-matrix operations.';
-    } else if (preset === 'moe') {
-        input.value = 'You are an expert in Mixture-of-Experts (MoE) SSD streaming, DirectStorage I/O, and UMA memory optimization.';
-    } else if (preset === 'creative') {
-        input.value = 'You are a creative writer and technology storyteller.';
-    } else {
-        input.value = 'You are a high-performance MoE AI assistant optimized for AMD Radeon 780M graphics.';
-    }
+    // Compare against undefined, not truthiness: the 'none' preset is a legitimate empty
+    // string, and `||` would silently substitute the default for it.
+    const value = SYSTEM_PRESETS[preset];
+    input.value = typeof value === 'string' ? value : SYSTEM_PRESETS.default;
 }
 
 function handleKeyDown(event) {

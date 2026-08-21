@@ -184,6 +184,102 @@ int main() {
         std::cout << "  [PASS] Batch sized to the pool is rejected.\n";
     }
 
+    // ---- Slot-count matrix: the counters that justify raising --slots. ----
+    //
+    // The measured case for a bigger expert cache rests entirely on hit rate, so the
+    // relationship between pool size and hits is asserted here rather than inferred from a
+    // benchmark. Wall-clock is deliberately not involved: it drifts with page-cache warmth
+    // and background I/O by more than the effect being measured.
+    {
+        // A fixed, deliberately skewed trace -- real routing is far from uniform, and a
+        // uniform trace would understate what the cache buys.
+        std::vector<std::vector<int>> trace;
+        for (int step = 0; step < 40; ++step) {
+            std::vector<int> batch;
+            for (int j = 0; j < 4; ++j) {
+                // Two thirds of requests land on experts 0..3, the rest spread over 0..15.
+                const int r = (step * 7 + j * 5) % 12;
+                batch.push_back(r < 8 ? (r % 4) : (r % kExpertCount));
+            }
+            // plan_experts requires distinct ids within a batch; de-duplicate.
+            std::vector<int> uniq;
+            for (int id : batch) {
+                bool seen = false;
+                for (int u : uniq) seen = seen || (u == id);
+                if (!seen) uniq.push_back(id);
+            }
+            trace.push_back(uniq);
+        }
+
+        double prev_hit_rate = -1.0;
+        for (size_t slots : {5u, 6u, 8u, 12u, 16u}) {
+            gturbo::ExpertStreamer s(ctx, layer_path, slots, kStride,
+                                     gturbo::EvictionPolicy::LFU);
+            s.initialize();
+
+            uint64_t expected_reads = 0;
+            for (const auto& batch : trace) {
+                auto plan = s.plan_experts(0, batch);
+                // Every slot handed back must be pinned, or a later expert in the same
+                // batch could evict an earlier one and the caller would bind the wrong
+                // weights -- fluent output, wrong model.
+                for (auto* slot : plan.slots) {
+                    assert(slot != nullptr && slot->pinned && "planned slots must be pinned");
+                }
+                assert(plan.hits.size() + plan.misses.size() == batch.size());
+                expected_reads += plan.misses.size();
+
+                s.fetch_misses(plan);
+
+                // Contents must match the id requested -- the stamp catches a misdirected
+                // read that counters alone would not.
+                for (size_t i = 0; i < batch.size(); ++i) {
+                    assert(expert_of(plan.slots[i]) == batch[i] && "slot holds another expert");
+                }
+                s.release_plan(plan);
+            }
+
+            // I/O must be performed exactly for misses and never for hits. This is the
+            // regression that cost the most: load_expert once re-read unconditionally, so
+            // the cache tracked a hit rate it never acted on and every byte was fetched
+            // twice over.
+            assert(s.total_io_calls() == expected_reads && "reads must equal misses exactly");
+            assert(s.total_misses() == expected_reads);
+            assert(s.total_bytes_read() == expected_reads * kStride);
+
+            // More cache must never mean fewer hits.
+            assert(s.hit_rate_pct() >= prev_hit_rate - 1e-9 &&
+                   "hit rate must be monotonically non-decreasing in slot count");
+            prev_hit_rate = s.hit_rate_pct();
+
+            assert(s.total_cache_memory_bytes() == slots * kStride);
+        }
+        std::cout << "  [PASS] Hit rate is monotonic in slot count; reads equal misses exactly.\n";
+
+        // Once the pool can hold the whole working set, steady state is zero I/O -- the
+        // property that makes a larger --slots worth its memory.
+        {
+            gturbo::ExpertStreamer s(ctx, layer_path, kExpertCount + 1, kStride,
+                                     gturbo::EvictionPolicy::LFU);
+            s.initialize();
+            for (int pass = 0; pass < 3; ++pass) {
+                for (const auto& batch : trace) {
+                    auto plan = s.plan_experts(0, batch);
+                    s.fetch_misses(plan);
+                    s.release_plan(plan);
+                }
+                if (pass == 0) {
+                    // Everything resident after one pass; nothing may be re-read after that.
+                    const uint64_t after_warm = s.total_io_calls();
+                    assert(after_warm <= kExpertCount && "warm-up must not re-read experts");
+                }
+            }
+            assert(s.total_io_calls() <= kExpertCount &&
+                   "a pool larger than the working set must reach zero steady-state I/O");
+            std::cout << "  [PASS] A pool covering the working set stops reading entirely.\n";
+        }
+    }
+
     std::error_code ec;
     fs::remove(layer_path, ec);
 

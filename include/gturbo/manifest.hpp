@@ -95,4 +95,29 @@ struct GTurboManifestV1 {
 // Throws GTurboFormatError if either is missing, malformed, or mutually inconsistent.
 std::string read_text_file(const std::string& path);
 
+// True when `dir` is a bundle that actually parses: manifest.json and
+// packed_experts/layout.json both present, well-formed, and mutually consistent.
+//
+// Deliberately validates by PARSING rather than by checking that files exist. A stale
+// placeholder bundle has both files and still cannot be loaded -- the retired repacker left
+// one in build/, whose layout.json predates the expertBlock format -- so an existence check
+// happily selects it over the real bundle.
+bool bundle_loads(const std::string& dir);
+
+// Resolves a bundle name or path to a directory that actually loads.
+//
+// An absolute path, or one containing a separator, is taken literally: second-guessing an
+// explicit path would load a model the user never asked for. A bare name is searched for in
+// the working directory, then next to the executable, then one level up -- that last one
+// matters because the exe lives in build\ while the bundle sits at the repo root, and
+// launching by double-click makes build\ the working directory.
+//
+// Returns the first candidate that parses. When none do, returns the input unchanged so the
+// caller's error names the place the user most likely meant.
+std::string resolve_bundle_path(const std::string& name_or_path);
+
+// Every directory a bare bundle name is searched in, in priority order. Used by the model
+// list so the GUI offers the same bundles the loader would actually resolve to.
+std::vector<std::string> bundle_search_roots();
+
 } // namespace gturbo

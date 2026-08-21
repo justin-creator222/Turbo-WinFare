@@ -16,14 +16,23 @@ engine_handle = None
 current_model_dir = None
 DEFAULT_MODEL_DIR = 'gemma-4-26b-a4b.gturbo'
 
+# Sampling knobs only.
+#
+# context_len and slots are deliberately ABSENT. They are fixed inside
+# ForwardRunner::initialize(), and the C ABI this script binds through exposes no setter for
+# either -- so any value stored here could never reach the engine. They used to live in this
+# dict anyway, which meant the Python server reported a configuration it had no ability to
+# apply: the default read `context_len: 62000`, fifteen times the engine's hard maximum of
+# 4096, and nothing ever noticed because the number was never used for anything.
+#
+# The native server (turbo-winfare.exe, the canonical front-end) does support both, via
+# POST /api/config followed by POST /api/load_model. Use it if you need them.
 current_config = {
-    'context_len': 62000,
-    'slots': 16,
     'eviction_policy': 'LFU',
     'temperature': 0.20,
     'top_p': 0.90,
-    'top_k': 16,
-    'max_tokens': 2000
+    'top_k': 64,
+    'max_tokens': 512
 }
 
 def init_native_engine():
@@ -195,10 +204,10 @@ class GUIHandler(http.server.SimpleHTTPRequestHandler):
 
         if self.path.startswith('/api/config'):
             req = json.loads(post_data) if post_data else {}
-            if 'context_len' in req:
-                current_config['context_len'] = int(req['context_len'])
-            if 'slots' in req:
-                current_config['slots'] = int(req['slots'])
+            # context_len / slots are accepted from the GUI and ignored, because this server
+            # cannot apply them (see current_config). Saying so in the response is better
+            # than storing a value that will never take effect.
+            unsupported = [k for k in ('context_len', 'slots') if k in req]
             if 'eviction_policy' in req:
                 current_config['eviction_policy'] = str(req['eviction_policy'])
             if 'temperature' in req:
@@ -210,7 +219,12 @@ class GUIHandler(http.server.SimpleHTTPRequestHandler):
             if 'max_tokens' in req:
                 current_config['max_tokens'] = int(req['max_tokens'])
 
-            self.wfile.write(json.dumps({'status': 'SUCCESS', 'config': current_config}).encode('utf-8'))
+            body = {'status': 'SUCCESS', 'config': current_config, 'requires_reload': False}
+            if unsupported:
+                body['ignored'] = unsupported
+                body['message'] = ('This Python bridge cannot change ' + ', '.join(unsupported) +
+                                   '; the C ABI exposes no setter. Use turbo-winfare.exe.')
+            self.wfile.write(json.dumps(body).encode('utf-8'))
             return
 
         elif self.path.startswith('/api/generate'):
@@ -220,16 +234,12 @@ class GUIHandler(http.server.SimpleHTTPRequestHandler):
             temperature = float(req.get('temperature', current_config['temperature']))
             top_p = float(req.get('top_p', current_config['top_p']))
             top_k = int(req.get('top_k', current_config['top_k']))
-            context_len = int(req.get('context_len', current_config['context_len']))
-            slots = int(req.get('slots', current_config['slots']))
             eviction_policy = str(req.get('eviction_policy', current_config['eviction_policy']))
 
             current_config['max_tokens'] = max_tokens
             current_config['temperature'] = temperature
             current_config['top_p'] = top_p
             current_config['top_k'] = top_k
-            current_config['context_len'] = context_len
-            current_config['slots'] = slots
             current_config['eviction_policy'] = eviction_policy
 
             # There is no Python-side generation. Either the native engine produces text or

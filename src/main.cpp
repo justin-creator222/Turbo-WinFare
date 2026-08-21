@@ -151,6 +151,29 @@ int main(int argc, char* argv[]) {
         return false;
     };
 
+    // Non-numeric text used to escape the parse loop as an unhandled std::invalid_argument,
+    // which terminates the process instead of printing a usage error.
+    auto parse_int = [](const std::string& flag, const char* text, int lo, int hi,
+                        int& out) -> bool {
+        try {
+            const std::string value(text);
+            size_t consumed = 0;
+            const long parsed = std::stol(value, &consumed);
+            if (consumed != value.size()) throw std::invalid_argument("trailing characters");
+            if (parsed < lo || parsed > hi) {
+                std::cerr << "Error: " << flag << " must be between " << lo << " and " << hi
+                          << " (got " << parsed << ")" << std::endl;
+                return false;
+            }
+            out = static_cast<int>(parsed);
+            return true;
+        } catch (const std::exception&) {
+            std::cerr << "Error: " << flag << " expects an integer, got '" << text << "'"
+                      << std::endl;
+            return false;
+        }
+    };
+
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") {
@@ -183,12 +206,25 @@ int main(int argc, char* argv[]) {
         // runs here unchanged; ours stay canonical in --help.
         } else if (arg == "--context" || arg == "--max-context") {
             if (!need_value(arg, i)) return 2;
-            // Max context in tokens; 0 (default) auto-sizes from installed RAM.
-            max_context = std::stoi(argv[++i]);
+            // Max context in tokens; 0 auto-sizes from installed RAM.
+            //
+            // Range-checked like --max-tokens and --queue-limit. Unchecked, `--context abc`
+            // threw an unhandled exception (the parse loop sits outside the try wrapping the
+            // rest of main), and a negative value silently reverted to auto-sizing rather
+            // than doing what was asked.
+            if (!parse_int(arg, argv[++i], 0, gturbo::ForwardRunner::kAttentionMaxSpan,
+                           max_context)) {
+                return 2;
+            }
         } else if (arg == "--slots" || arg == "--expert-cache-slots") {
             if (!need_value(arg, i)) return 2;
-            // Expert cache slots per layer; 0 (default) auto-sizes from installed RAM.
-            expert_slots = static_cast<size_t>(std::stoul(argv[++i]));
+            // Expert cache slots per layer; 0 auto-sizes from installed RAM. The real
+            // upper bound is per-model (num_experts) and is enforced by resolve_slots once
+            // the manifest is known; this only rejects what is nonsense for any model.
+            // `--slots -1` used to wrap through stoul into SIZE_MAX.
+            int slots_arg = 0;
+            if (!parse_int(arg, argv[++i], 0, 4096, slots_arg)) return 2;
+            expert_slots = static_cast<size_t>(slots_arg);
         } else if (arg == "--max-tokens" || arg == "--max-new") {
             if (!need_value(arg, i)) return 2;
             max_tokens = std::stoi(argv[++i]);
@@ -341,7 +377,9 @@ int main(int argc, char* argv[]) {
             runner->initialize();
             // Expert streamers open lazily per layer, so nothing is allocated yet -- the old
             // message here claimed a 166 MB slot pool had already been reserved.
-            std::cout << "      Expert streamers open lazily on first use (8 UMA slots/layer)\n\n";
+            // The slot count is NOT restated here: it was hardcoded to 8 and
+            // contradicted the real figure initialize() prints two lines above.
+            std::cout << "      Expert streamers open lazily on first use." << std::endl << std::endl;
         } catch (const std::exception& ex) {
             // In GUI mode a bad model must not prevent the server from starting -- otherwise
             // the user gets a closed browser tab and no explanation. Report it here and let
@@ -372,6 +410,11 @@ int main(int argc, char* argv[]) {
             }
             openai_cfg.max_context = runner ? runner->max_context() : 4096;
             server->set_openai_config(openai_cfg);
+            // Hand the CLI's engine config to the server so a GUI-initiated reload inherits
+            // it. Without this, launching with `--slots 44 --gui` and then pressing Load
+            // Model silently dropped back to RAM auto-sizing, because ServerConfig starts at
+            // the 0 = auto sentinel and the reload path reads it verbatim.
+            server->set_initial_engine_config(max_context, static_cast<int>(expert_slots));
             server->start(gui_port, runner, ctx);
 
             std::cout << "      OpenAI-compatible API at http://127.0.0.1:" << gui_port

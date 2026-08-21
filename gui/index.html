@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Turbo-WinFare | Native AMD Legion Go S Inference Engine</title>
+    <title>Turbo-WinFare | Native DirectX 12 Inference Engine</title>
     <link rel="icon" type="image/svg+xml" href="logo.svg">
     <link rel="stylesheet" href="styles.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -18,7 +18,7 @@
                 </div>
                 <div class="brand-title">
                     <h1>TURBO-WINFARE</h1>
-                    <span>Lenovo Legion Go S • DirectX 12 MoE Engine</span>
+                    <span>DirectX 12 MoE Engine</span>
                 </div>
             </div>
 
@@ -63,13 +63,14 @@
                         <span class="sp-icon">⚙️</span>
                         <label for="sys-preset-select">System Prompt Persona:</label>
                         <select id="sys-preset-select" onchange="applySystemPreset()">
-                            <option value="default" selected>⚡ General AI Assistant</option>
-                            <option value="cpp">💻 C++23 & HLSL DirectCompute Expert</option>
-                            <option value="moe">🚀 MoE & SSD Architecture Specialist</option>
-                            <option value="creative">🎨 Creative Writing & Design Specialist</option>
+                            <option value="default" selected>⚡ General Assistant</option>
+                            <option value="code">💻 Software Engineer</option>
+                            <option value="explain">🧭 Technical Explainer</option>
+                            <option value="creative">🎨 Creative Writer</option>
+                            <option value="none">⏱ None — fastest first token</option>
                         </select>
                     </div>
-                    <textarea id="sys-prompt-input" rows="1" placeholder="Custom system instructions...">You are a high-performance MoE AI assistant optimized for AMD Radeon 780M graphics.</textarea>
+                    <textarea id="sys-prompt-input" rows="1" placeholder="Custom system instructions...">You are a helpful, knowledgeable assistant. Answer the question that was asked, directly and without preamble. Match length to the question: one sentence when that is enough, more when the topic needs it. If you do not know something or are uncertain, say so plainly instead of guessing.</textarea>
                 </div>
 
                 <!-- Chat Transcript Area -->
@@ -78,7 +79,7 @@
                         <div class="avatar">⚡</div>
                         <div class="msg-content">
                             <div class="bubble">
-                                Welcome to <strong>Turbo-WinFare</strong>! The engine is ready for real-time Gemma 4 26B-A4B MoE SSD streaming inference on your Lenovo Legion Go S APU.
+                                Welcome to <strong>Turbo-WinFare</strong>! The engine is ready for real-time Gemma 4 26B-A4B MoE SSD streaming inference on your GPU.
                                 <br><br>
                                 💡 <em>Use the Model Repository sidebar to select or load a <code>.gturbo</code> model, inspect real-time RAM metrics below, or click a preset prompt to begin!</em>
                             </div>
@@ -89,7 +90,7 @@
                 <!-- Composer -->
                 <div class="composer-container">
                     <div class="presets">
-                        <div class="preset-chip" onclick="usePreset('Explain the Gemma 4 26B-A4B MoE SSD streaming architecture on Legion Go S:')">⚡ MoE Architecture</div>
+                        <div class="preset-chip" onclick="usePreset('Explain the Gemma 4 26B-A4B MoE SSD streaming architecture:')">⚡ MoE Architecture</div>
                         <div class="preset-chip" onclick="usePreset('Write a high-performance C++23 DirectCompute HLSL Wave32 shader for matrix multiplication:')">💻 Write HLSL Shader</div>
                         <div class="preset-chip" onclick="usePreset('Why is DirectStorage unbuffered async IOCP essential for 16KB expert streaming?')">🚀 DirectStorage I/O</div>
                         <div class="preset-chip" onclick="usePreset('Compare LFU vs LRU expert cache eviction policies for 16GB UMA laptops:')">📊 Cache Eviction Analysis</div>
@@ -211,13 +212,19 @@
                                 <span>Max Context Tokens</span>
                                 <span class="val" id="val-context">&#8212;</span>
                             </div>
-                            <!-- 4096 is the ceiling: ATTN_MAX_SPAN in shaders/Attention.hlsl
-                                 stages scores in 32 KB of groupshared. The list used to offer
-                                 8192 and default to 62000, neither of which the engine can
-                                 initialize. -->
+                            <!-- Rebuilt at runtime by applyContextBounds() from the
+                                 `context_max` the engine reports, so this ladder cannot drift
+                                 out of sync with ATTN_MAX_SPAN. Today that ceiling is 4096:
+                                 shaders/Attention.hlsl stages the score span in groupshared,
+                                 which is capped at 32 KB. The list used to offer 8192 and
+                                 default to 62000, neither of which the engine can initialize.
+                                 These entries are only the pre-hydration fallback. -->
                             <select id="cfg-context" onchange="updateConfig()">
+                                <option value="512">512 Tokens</option>
                                 <option value="1024">1024 Tokens</option>
+                                <option value="1536">1536 Tokens</option>
                                 <option value="2048">2048 Tokens</option>
+                                <option value="3072">3072 Tokens</option>
                                 <option value="4096" selected>4096 Tokens</option>
                             </select>
                         </div>
@@ -226,7 +233,11 @@
                                 <span>UMA Expert Slots / Layer</span>
                                 <span class="val" id="val-slots">&#8212;</span>
                             </div>
-                            <input type="range" id="cfg-slots" min="1" max="32" value="16" oninput="updateConfig()" onchange="updateConfig()">
+                            <!-- Bounds are replaced at runtime by applySlotBounds() from the loaded model:
+                                 min is top_k_experts + 1 (below that the engine throws, because
+                                 eviction has no unpinned slot), max is experts-per-layer (a larger
+                                 pool can never fill). These are only the pre-hydration defaults. -->
+                            <input type="range" id="cfg-slots" min="9" max="128" value="16" oninput="updateConfig()" onchange="updateConfig()">
                         </div>
                         <div class="control-item">
                             <div class="control-header">
