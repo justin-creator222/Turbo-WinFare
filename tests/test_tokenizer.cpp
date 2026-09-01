@@ -6,6 +6,10 @@
 #include <filesystem>
 #include <algorithm>
 
+// Last include on purpose: check.hpp redefines assert so it survives NDEBUG, and <cassert>
+// (pulled in by anything included after it) would silently define assert back to a no-op.
+#include "check.hpp"
+
 namespace fs = std::filesystem;
 
 int main() {

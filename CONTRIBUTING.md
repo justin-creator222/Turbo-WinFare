@@ -18,8 +18,8 @@ Turbo-WinFare is a Windows/Direct3D 12 port of
 ```powershell
 python tools/download_toolchain.py
 $env:PATH = "C:\w64devkit\bin;" + $env:PATH
-cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=C:/w64devkit/bin/g++.exe
-cmake --build build --config Release
+cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=C:/w64devkit/bin/g++.exe -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 

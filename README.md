@@ -72,8 +72,8 @@ Then put the toolchain on `PATH` **before configuring** — this is not optional
 
 ```powershell
 $env:PATH = "C:\w64devkit\bin;" + $env:PATH
-cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=C:/w64devkit/bin/g++.exe
-cmake --build build --config Release
+cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=C:/w64devkit/bin/g++.exe -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
@@ -207,20 +207,27 @@ producing output that stays fluent and is simply wrong.
 
 ## Performance
 
-Measured on a 24 GB Ryzen/Radeon desktop box.
+Measured on a >= 30 GB Ryzen/Radeon desktop box, `-O3`, 120 decode tokens, machine idle.
 
 | | Turbo-WinFare | TurboFieldfare (reference) |
 |---|---|---|
-| Decode | **7.0 tok/s** at the auto-sized 24 slots, **9.2 tok/s** at `--slots 44` | 5.1–6.3 tok/s on an 8 GB M2 Air |
-| Decode, constrained | **6.0 tok/s** at 16 slots (the 16 GB Legion Go S target) | — |
-| Prefill | ~5.7 tok/s | ~28 tok/s |
+| Decode | **9.9 tok/s** at `--slots 24`, **16.2 tok/s** at `--slots 44` | 5.1–6.3 tok/s on an 8 GB M2 Air |
+| Decode, constrained | **7.5 tok/s** at 16 slots (the 16 GB Legion Go S target) | — |
+| Prefill | ~7.6 tok/s | ~28 tok/s |
 
-Where decode time goes: ~34% expert I/O, ~41% GPU wait, ~9% LM head, ~16% other CPU. The engine is
-nowhere near compute- or bandwidth-bound, so the remaining headroom is in kernel efficiency and
-batched prefill, not in hardware. [docs/PERFORMANCE.md](docs/PERFORMANCE.md) has the full
+> **Figures published before 2026-08-31 were measured on an unoptimized build.** `CMakeLists.txt`
+> set no `CMAKE_BUILD_TYPE`, and the `--config Release` in the documented build command is
+> ignored by Ninja, so the engine compiled at `-O0`. Building it properly is worth **+5–8% on
+> decode** and **3.8x on the `--cpu` reference**; the small decode gain is expected, because
+> decode is ~41% disk I/O and ~50% GPU wait. See [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
+Where decode time goes: ~41% expert I/O, ~50% GPU wait, ~9% other CPU — three disjoint buckets
+summing to 100%, with the LM head a further ~10% that *spans* the GPU-wait and CPU buckets rather
+than forming a fourth. The engine is nowhere near compute- or bandwidth-bound, so the remaining
+headroom is in kernel efficiency and batched prefill, not in hardware. [docs/PERFORMANCE.md](docs/PERFORMANCE.md) has the full
 optimization history, including the changes that were measured and *rejected*.
 
-`--cpu` runs a single-threaded scalar FP32 reference at ~0.1 tok/s. Its job is to be right, not
+`--cpu` runs a single-threaded scalar FP32 reference at ~0.43 tok/s (2.3 s/token). Its job is to be right, not
 fast; it is the ground truth the GPU kernels are verified against, and `--dump-tensors` writes
 its per-stage activations for diffing.
 
@@ -229,17 +236,22 @@ its per-stage activations for diffing.
 Defaults stay conservative. Raising the expert cache is an explicit opt-in — `--slots N`, or the
 sidebar control followed by a reload. Interleaved, 120 tokens, machine idle:
 
-| slots per layer | pool | peak RSS | cache hit | decode |
-|---|---|---|---|---|
-| 16 | 1.5 GB | ~3.3 GB | 54.1% | 6.0 tok/s |
-| 24 *(auto-sized here)* | 2.3 GB | 4.3 GB | 64.8% | **7.0 tok/s** |
-| 44 | 4.1 GB | 6.2 GB | 82.7% | **9.2 tok/s** |
-| 64 | 6.0 GB | ~8.1 GB | 90.3% | 7.8–8.9 tok/s |
+| slots per layer | pool | cache hit | decode (median of 3) |
+|---|---|---|---|
+| 16 | 1.5 GB | 56.8% | 7.54 tok/s |
+| 24 | 2.3 GB | 69.5% | 9.87 tok/s |
+| 32 *(auto-sized here)* | 3.1 GB | 72.2% | ~14 tok/s |
+| 44 | 4.1 GB | 86.3% | **16.20 tok/s** |
+| 64 | 6.0 GB | 92.0% | **17.38 tok/s** |
 
-About **+30% for roughly 2 GB**, with the sweet spot near 44 on this machine. More is not better:
-64 slots is *slower* than 44 despite a 90% hit rate, because the pool competes with the OS page
-cache for the same physical memory — the streamer deliberately relies on that cache. The same
-effect is why the auto-size ladder stops at 32. Footprint is predictable:
+More than doubling the pool roughly doubles throughput here. **This is machine-dependent, and it
+used to come out the other way:** on the original 24 GB box, 64 slots was *slower* than 44 despite
+a 90% hit rate, because a 6 GB pool squeezed the OS page cache the streamer deliberately relies
+on. With >= 30 GB there is room for both. The principle is unchanged — the pool and the page cache
+compete for the same physical memory, and more is not automatically better — but where the
+crossover falls depends on installed RAM, so measure on your own machine rather than copying a
+number from this table. **The auto-size ladder still stops at 32 on purpose:** it has to be safe
+on the 16 GB Legion Go S, where the original result holds exactly. Footprint is predictable:
 
 ```
 peak RSS  ≈  1.29 GB (resident weights)  +  KV cache  +  slots × 30 × 3.2 MB
@@ -305,7 +317,7 @@ The forward pass and format match. The product surface around them is still catc
 | Thought-channel suppression | The generation prompt opens a `thought` channel and nothing parses it |
 | Tool calling and channel decoding | — |
 | KV reuse across turns (prompt cache) | Every request re-prefills from scratch; no `--prompt-cache-mode` |
-| Chunked/batched prefill | ~5.7 tok/s here vs ~28 in the reference. Biggest remaining opportunity |
+| Chunked/batched prefill | ~7.6 tok/s here vs ~28 in the reference. Biggest remaining opportunity |
 | FP16 KV, context above 4096 | Needs an online-softmax rewrite of `Attention.hlsl` |
 | `--messages-file`, `--expert-cache-policy`, `--prefill`, `--prefill-chunk-tokens`, `--rdadvise` | Not stubbed — a flag that parses and does nothing is worse than a clean error |
 | Repack/installer GUI | Use `tools/convert_hf_to_gturbo.py` |

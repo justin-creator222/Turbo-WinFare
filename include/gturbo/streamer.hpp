@@ -49,11 +49,33 @@ public:
     // Splitting the plan from the fetch is what makes hit-first dispatch possible: the
     // caller can queue GPU work for the experts already resident, and for the shared expert
     // which needs no expert data at all, while the misses are still in flight.
+    //
+    // Move-only, and it releases itself. The explicit release_plan() call in the decode loop
+    // sits ~115 lines after plan_experts() with the whole routed-expert encode in between;
+    // anything that throws in that window -- a missing layout.expertBlock entry, a dispatch
+    // error, a device loss -- used to leak the plan's pins permanently. The slots stayed
+    // pinned forever, and the NEXT token then died with "no evictable slot", turning a
+    // recoverable error into a dead runner one token later. Making the release automatic
+    // means the failure cannot outlive the scope that caused it.
     struct ExpertPlan {
         std::vector<ExpertSlot*> slots;   // one per request, in request order
         std::vector<size_t> hits;         // indices into `slots` needing no I/O
         std::vector<size_t> misses;       // indices into `slots` awaiting a read
         ExpertStreamer* owner{nullptr};
+
+        ExpertPlan() = default;
+        ~ExpertPlan() { release(); }
+
+        // Copying would double-release one plan's pins. Moving transfers ownership and
+        // leaves the source inert, which is what lets plan_experts return by value.
+        ExpertPlan(const ExpertPlan&) = delete;
+        ExpertPlan& operator=(const ExpertPlan&) = delete;
+        ExpertPlan(ExpertPlan&& other) noexcept { *this = std::move(other); }
+        ExpertPlan& operator=(ExpertPlan&& other) noexcept;
+
+        // Idempotent; delegates to owner->release_plan(*this). Defined in the .cpp because
+        // ExpertStreamer is still incomplete here.
+        void release();
 
         bool valid() const { return owner != nullptr; }
     };
@@ -105,6 +127,12 @@ private:
     ExpertSlot* find_or_evict_slot(int expert_id, bool& was_hit);
     void issue_read(ExpertSlot* slot, uint64_t file_offset, size_t count);
     void await_read(ExpertSlot* slot, size_t count);
+
+    // Retires a read that is still in flight, cancelling it first so this does not sit
+    // waiting on I/O nobody wants any more. Never throws: it is called from the destructor
+    // and from an exception unwind, and the only thing it can usefully do on failure is stop
+    // claiming the slot is idle.
+    void drain_pending(ExpertSlot* slot) noexcept;
 };
 
 } // namespace gturbo

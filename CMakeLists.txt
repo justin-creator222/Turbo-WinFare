@@ -4,6 +4,59 @@ project(turbo_winfare LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Optimization level. This is load-bearing and was missing entirely.
+#
+# Nothing here set CMAKE_BUILD_TYPE, and the documented build command was
+# `cmake --build build --config Release` -- but `--config` only means something to a
+# MULTI-config generator (Visual Studio, Xcode). Ninja is single-config, so it accepted the
+# flag and ignored it, and CMake emitted `FLAGS = -std=gnu++23` with no -O at all. Every
+# performance figure recorded before this line existed was measured on a -O0 binary: the
+# per-token CPU work, the tokenizer, sampling, and the whole scalar --cpu reference.
+#
+# The build type is chosen at CONFIGURE time. `--config` on the build line is still inert.
+if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
+                 Debug Release RelWithDebInfo MinSizeRel)
+endif()
+
+# Off by default on purpose: turbo-winfare.exe is a shipped artifact and the build host is not
+# necessarily the Zen 4 target. Turn it on for a local benchmark build only.
+option(TURBO_NATIVE_ARCH "Tune the build for the building machine (-march=native)" OFF)
+if (TURBO_NATIVE_ARCH)
+    add_compile_options(-march=native)
+endif()
+
+# Deliberately NOT -ffast-math. The GPU path is gated on matching the scalar CPU reference
+# token-for-token under greedy decoding; relaxing IEEE semantics on one side of that
+# comparison would retire the only end-to-end correctness check this project has.
+
+# Guard against a cache that has had its per-config flags blanked.
+#
+# This is not hypothetical -- it is how the project shipped a -O0 "Release" build for its
+# entire history. The cache in build/ had CMAKE_CXX_FLAGS_RELEASE, _DEBUG, _RELWITHDEBINFO
+# and _MINSIZEREL all set to the empty string, so selecting a build type changed nothing and
+# CMake emitted `FLAGS = -std=gnu++23`. A clean cache populates them correctly, which is what
+# makes this so easy to miss: it reproduces only in the tree you already have. Restore the
+# compiler defaults rather than trusting whatever is cached.
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    if (NOT CMAKE_CXX_FLAGS_RELEASE MATCHES "-O")
+        set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG"
+            CACHE STRING "Flags for Release" FORCE)
+    endif()
+    if (NOT CMAKE_CXX_FLAGS_RELWITHDEBINFO MATCHES "-O")
+        set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG"
+            CACHE STRING "Flags for RelWithDebInfo" FORCE)
+    endif()
+endif()
+
+# Print the effective flags. The whole failure above was silent; one STATUS line makes the
+# next occurrence obvious at configure time instead of after a benchmark.
+message(STATUS "turbo-winfare: CMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}'")
+string(TOUPPER "${CMAKE_BUILD_TYPE}" _turbo_cfg)
+message(STATUS "turbo-winfare: CXX flags = '${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${_turbo_cfg}}'")
+
+
 include_directories(include)
 
 # Core engine library sources

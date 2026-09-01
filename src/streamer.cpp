@@ -13,14 +13,27 @@ ExpertStreamer::ExpertStreamer(std::shared_ptr<D3D12Context> ctx,
       expert_stride_(expert_stride), policy_(policy) {
 }
 
+void ExpertStreamer::ExpertPlan::release() {
+    if (owner) owner->release_plan(*this);   // release_plan clears `owner`
+}
+
+ExpertStreamer::ExpertPlan&
+ExpertStreamer::ExpertPlan::operator=(ExpertPlan&& other) noexcept {
+    if (this != &other) {
+        release();                       // never silently drop our own pins
+        slots = std::move(other.slots);
+        hits = std::move(other.hits);
+        misses = std::move(other.misses);
+        owner = other.owner;
+        other.owner = nullptr;           // the moved-from plan must release nothing
+    }
+    return *this;
+}
+
 ExpertStreamer::~ExpertStreamer() {
     // Drain anything still in flight before the OVERLAPPED structures die with the slots.
     for (auto& slot : slots_) {
-        if (slot && slot->read_pending) {
-            DWORD n = 0;
-            GetOverlappedResult(file_handle_, &slot->ov, &n, TRUE);
-            slot->read_pending = false;
-        }
+        if (slot) drain_pending(slot.get());
     }
     if (file_handle_ != INVALID_HANDLE_VALUE) {
         CloseHandle(file_handle_);
@@ -168,9 +181,31 @@ void ExpertStreamer::clear_cache() {
 // Starts an asynchronous read into the slot's UMA buffer and returns immediately.
 // Paired with await_read. Splitting issue from wait is what lets a batch put all its
 // misses in flight at once instead of serializing at queue depth 1.
+void ExpertStreamer::drain_pending(ExpertSlot* slot) noexcept {
+    if (!slot || !slot->read_pending) return;
+    if (file_handle_ != INVALID_HANDLE_VALUE) {
+        // Cancel first, then wait for the cancellation to actually retire. The wait is the
+        // part that matters: until the kernel is finished with this request it owns both the
+        // OVERLAPPED and the mapped destination page, so returning early would hand a live
+        // DMA target to the next issue_read.
+        CancelIoEx(file_handle_, &slot->ov);
+        DWORD n = 0;
+        GetOverlappedResult(file_handle_, &slot->ov, &n, TRUE);
+    }
+    slot->read_pending = false;
+}
+
 void ExpertStreamer::issue_read(ExpertSlot* slot, uint64_t file_offset, size_t count) {
     if (file_handle_ == INVALID_HANDLE_VALUE) {
         throw GTurboFormatError("Expert file '" + layer_file_path_ + "' is not open");
+    }
+    if (slot->read_pending) {
+        // Reusing a slot whose read has not retired overwrites an OVERLAPPED the kernel
+        // still owns and re-points a live DMA write. That corrupts memory rather than
+        // failing, so it is an invariant worth asserting in release builds.
+        throw GTurboFormatError(
+            "Expert slot already has a read in flight on '" + layer_file_path_ +
+            "'. A previous batch was abandoned without draining its I/O.");
     }
 
     ResetEvent(slot->event);
@@ -253,14 +288,26 @@ void ExpertStreamer::fetch_misses(ExpertPlan& plan) {
             await_read(plan.slots[i], static_cast<size_t>(expert_stride_));
         }
     } catch (...) {
-        // A failed read leaves stale bytes behind, so invalidate every miss rather than
-        // letting a later lookup treat it as a hit.
+        // Two separate obligations here, and only the second used to be met.
+        //
+        // First, DRAIN. If await_read throws on miss 3, misses 4..7 are still in flight and
+        // the kernel still owns their OVERLAPPED structures and their mapped destinations.
+        // Clearing read_pending without waiting -- which is what this did -- told the
+        // destructor there was nothing to drain and let the next issue_read on that slot
+        // ResetEvent and overwrite an OVERLAPPED mid-transfer. That is memory corruption
+        // with no diagnostic, and it lands in a UMA page the GPU is also reading.
+        //
+        // Second, INVALIDATE. find_or_evict_slot stamps expert_id onto the victim before the
+        // bytes arrive, so a slot whose read failed would otherwise be served as a hit
+        // holding a different expert's weights -- fluent output, wrong model.
+        for (size_t i : plan.misses) {
+            drain_pending(plan.slots[i]);
+        }
         {
             std::lock_guard<std::mutex> guard(lock_);
             for (size_t i : plan.misses) {
                 plan.slots[i]->expert_id = -1;
                 plan.slots[i]->frequency = 0;
-                plan.slots[i]->read_pending = false;
             }
         }
         release_plan(plan);

@@ -121,6 +121,12 @@ float gemv_int4_row_lane(ByteAddressBuffer W, uint w_base,
         // (local array, explicit scalars, and with `precise`). DXC already merges these into
         // wide fetches; hoisting all 8 values by hand only inflates register pressure. Do
         // not "optimize" this without measuring.
+        //
+        // A sibling dense engine measured Load4 ~12% FASTER on the same GPU. That is not a
+        // contradiction: its inner loop reads activations as float4 and folds scale/bias per
+        // group, so it has different register pressure. The result above is for THIS loop
+        // shape. Both are recorded in docs/PERFORMANCE.md; re-measure only if this kernel
+        // ever becomes the bottleneck, which at ~41% expert I/O and ~50% GPU wait it is not.
         [unroll]
         for (uint w = 0; w < 8; ++w) {
             const uint packed = W.Load(gw + w * 4);     // 8 nibbles = 8 elements

@@ -19,8 +19,8 @@ The build uses **CMake + Ninja + MinGW g++ from `C:\w64devkit`**, NOT MSVC. Ninj
 anywhere on `PATH` (a Python venv install works fine).
 
 ```powershell
-cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=C:/w64devkit/bin/g++.exe
-cmake --build build --config Release
+cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=C:/w64devkit/bin/g++.exe -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 ctest --test-dir build --output-on-failure   # test_format, test_tokenizer, test_gpu_kernels, test_convert
 ```
 
@@ -33,6 +33,38 @@ Run a single test binary directly (they are standalone, no framework):
 ```
 
 CMake copies `gui/` and `shaders/` into the build directory on every build; shaders are resolved at runtime relative to the executable.
+
+**`-DCMAKE_BUILD_TYPE=Release` at CONFIGURE time is load-bearing, and `--config Release` on the
+build line is not.** `--config` only means anything to a multi-config generator (Visual Studio,
+Xcode); Ninja is single-config, so it accepted the flag and ignored it. Nothing set
+`CMAKE_BUILD_TYPE`, so CMake emitted `FLAGS = -std=gnu++23` with **no `-O` at all** and the
+engine was built at `-O0` for the whole life of the project -- every performance figure
+recorded before 2026-08-31 was measured on an unoptimized binary. Configure now defaults to
+`Release` when no build type is given, and prints the effective flags:
+
+```
+-- turbo-winfare: CMAKE_BUILD_TYPE='Release'
+-- turbo-winfare: CXX flags = ' -O3 -DNDEBUG'
+```
+
+If that second line ever shows no `-O`, stop and fix it before measuring anything. There is a
+guard in [CMakeLists.txt](CMakeLists.txt) for the specific way this went wrong -- the cache in
+`build/` had `CMAKE_CXX_FLAGS_RELEASE`, `_DEBUG`, `_RELWITHDEBINFO` and `_MINSIZEREL` all
+blanked, so selecting a build type changed nothing. A *clean* cache populates them correctly,
+which is what made it so hard to see: it reproduced only in the tree you already had.
+
+`-march=native` is available as `-DTURBO_NATIVE_ARCH=ON` and is **off by default**, because
+`turbo-winfare.exe` is a shipped artifact and the build host is not necessarily the Zen 4
+target. `-ffast-math` is deliberately never enabled: the GPU path is gated on matching the
+scalar CPU reference token-for-token, and relaxing IEEE semantics on one side of that
+comparison would retire the only end-to-end correctness check the project has.
+
+**The test suite must be built in a way that lets it fail.** `Release` defines `NDEBUG`, which
+compiles `assert` out entirely -- and 293 assertions across eight of the nine test binaries are
+plain `assert`. [tests/check.hpp](tests/check.hpp) redefines `assert` so it survives `NDEBUG`,
+and every test `.cpp` includes it **last**, after any `<cassert>`: `<cassert>` has no include
+guard and re-defines `assert` on each inclusion, so a header pulled in later would silently
+undo it. Without that header, `assert(1 == 2)` in a Release build exits 0. Verified both ways.
 
 Toolchain bootstrap: `python tools/download_toolchain.py` installs w64devkit to `C:\w64devkit` **and** fetches `dxcompiler.dll` + `dxil.dll` into `build/`. Both are required -- **`C:\w64devkit\bin` must be on `PATH`** or g++ fails with `cannot execute 'as'`, and without DXC every shader fails to compile (there is deliberately no `cs_5_0` fallback).
 
@@ -124,8 +156,39 @@ Build artifacts from [CMakeLists.txt](CMakeLists.txt):
 Engine core (all in `gturbo::` namespace, headers under [include/gturbo/](include/gturbo/)):
 - `ForwardRunner` ([src/runner.cpp](src/runner.cpp)) -- orchestrator; owns the token decode loop, resident weight buffers, KV cache, and per-layer expert streamers. `produce_token` / `generate` / `generate_text` are the entry points.
 - `D3D12Context` ([src/d3d12_context.cpp](src/d3d12_context.cpp)) -- device/queue setup, UMA buffer allocation, memory telemetry.
+
+  **A lost device does not stop this engine on its own, so it is checked for explicitly.**
+  Every HRESULT on the submit path is now inspected -- `Close()`, `Signal()`,
+  `SetEventOnCompletion()` and both `Reset()` calls -- and a failure throws naming the call
+  site plus `GetDeviceRemovedReason()`. All five used to be discarded, and the resulting
+  failure mode is far worse than a crash: on a removed device `GetCompletedValue()` returns
+  `UINT64_MAX`, so every fence wait returns instantly; the router-index readback still maps
+  and hands back *stale* bytes, so the same eight experts look like cache hits in every layer;
+  and the greedy token readback returns whatever was there before. The engine keeps running
+  and reports a large tokens/sec attached to garbage output. A sibling engine chased exactly
+  that as a performance result before noticing the output was blank.
+
+  `wait_for_fence` also waits with a 60 s bound rather than `INFINITE` -- a hung device used
+  to hang the process with it -- and `ForwardRunner::initialize()` probes `device_ok()` once
+  after committing the 1.29 GB of resident weights, so an over-greedy allocation fails at load
+  with a clear message instead of surfacing far downstream.
 - `ComputePipelineManager` ([src/pipeline.cpp](src/pipeline.cpp)) -- loads/compiles the HLSL kernels in [shaders/](shaders/) and dispatches them.
 - `ExpertStreamer` ([src/streamer.cpp](src/streamer.cpp)) -- per-layer NVMe->UMA expert loading with an LFU/LRU DRAM cache; opened lazily per layer.
+
+  **`ExpertPlan` is move-only and releases its own pins.** The explicit `release_plan` call in
+  the decode loop sits ~115 lines after `plan_experts`, with the whole routed-expert encode in
+  between; anything throwing in that window used to leak the plan's pins permanently, and the
+  *next* token then died with "no evictable slot" -- a recoverable error becoming a dead runner
+  one token later.
+
+  **`fetch_misses` drains the reads it issued before unwinding.** It used to clear
+  `read_pending` on every miss without waiting, so a failure partway through left the kernel
+  still writing into slots the streamer believed were idle; the destructor then skipped them
+  and the next `issue_read` would `ResetEvent` and overwrite an `OVERLAPPED` mid-transfer, into
+  a UMA page the GPU is also reading. `issue_read` now also rejects a slot whose read has not
+  retired, which is the runtime detector for that state -- there is no deterministic unit test
+  for it, because a 3.3 MB read served from the page cache completes inline and nothing is ever
+  pending by the time an error is raised.
 - `KVCacheManager` ([src/kv_cache.cpp](src/kv_cache.cpp)) -- owns the per-layer FP32 K/V buffers and the ring indexing (`physical_slot`) for **both** paths. `ForwardRunner` holds no KV buffers of its own.
 - `Tokenizer` ([src/tokenizer.cpp](src/tokenizer.cpp)) -- HF `tokenizer.json` BPE with byte fallback, Gemma 4 `<|turn>`/`<turn|>` markers (NOT Gemma 2/3 `<start_of_turn>`). A default-constructed `Tokenizer` holds no vocabulary and throws on `encode`.
 - Format layer: `GTurboManifestV1` ([src/manifest.cpp](src/manifest.cpp)), `PackedExpertsLayoutV1` ([src/packed_experts.cpp](src/packed_experts.cpp)), `ResidentIndexCodec` ([src/resident_index.cpp](src/resident_index.cpp)), constants in [include/gturbo/format.hpp](include/gturbo/format.hpp).
@@ -149,6 +212,23 @@ Agreement is judged with numpy's `allclose` (`|got-want| <= 1e-5 + 1e-4*|want|`)
 relative test. GPU transcendentals differ from libm by a couple of ULPs and near-zero results
 then show a big relative error for ~1e-7 absolute -- while a real logic bug is never marginal
 (the Wave64 bug below was off by 0.29 relative, everywhere).
+
+**Byte offsets are checked for BIT-IDENTICAL agreement, not tolerance.** Every original GEMV
+case passed `0` for `w_off`/`s_off`/`b_off`/`x_off`/`out_off`/`row_base` and bound three
+*separate* buffers -- which the engine never does. Production binds one `resident.bin` buffer as
+`{RES, RES, RES, x}` at three 16 KB-aligned offsets, and chunks the 262,144-row LM head with
+`row_base > 0`. So the offset arithmetic -- the code that decides *which expert's weights a
+routed GEMV actually reads* -- had no coverage at all. It does now, and the check is equality
+against the same matrix run at offset zero: relocating a tensor cannot change the arithmetic, so
+there is no tolerance to argue about, and an offset wrong by less than a rounding error is still
+caught. Verified by breaking the kernel three ways: zeroing `w_off` fails 200/200 rows, zeroing
+`out_off` 200/200, zeroing `row_base` exactly the 72 rows of the second chunk -- and in all
+three the *old* zero-offset cases stayed green.
+
+Do not add a second tolerance-based CPU comparison on a fresh random matrix: one was tried and
+failed on row 135 of 200 (0.0109138 against 0.0109309), a 1.7e-5 disagreement in a 2,816-term
+FP32 sum whose terms are of order 1. That is cancellation, not a bug, and it is why the offset
+check is an equality check.
 
 **Do not assume a wave width.** RDNA 3 runs a 256-thread group as Wave64, not Wave32. A
 kernel that reduces across waves must use `WaveGetLaneCount()` / `WaveIsFirstLane()` -- the
@@ -194,11 +274,11 @@ still missing is the product surface above it -- see "Parity with the reference"
 - **Stage 1 (done)** -- real data pipeline. [tools/convert_hf_to_gturbo.py](tools/convert_hf_to_gturbo.py) now streams the pinned checkpoint (`mlx-community/gemma-4-26b-a4b-it-4bit` @ `0d77464e`) into a 13.3 GB bundle without ever holding a shard in memory; the tokenizer is a real `tokenizer.json` BPE with byte fallback; `manifest.json`/`layout.json` are actually parsed.
 - **Stage 2 (done)** -- [src/cpu_reference.cpp](src/cpu_reference.cpp) is a scalar FP32 forward pass that **produces correct Gemma 4 text**. It touches no D3D12 and is the ground truth for Stage 3.
 - **Stage 3 (done)** -- the DirectCompute path works. All 15 kernels are verified against the CPU reference, and **GPU greedy output matches CPU greedy output token-for-token**.
-- **Stage 4 (done)** -- performance. **2.34 -> 8.8 tok/s decode**, beating the Swift/Metal reference's 5.1-6.3 tok/s on an M2 Air by ~40%.
+- **Stage 4 (done)** -- performance. **2.34 -> 8.8 tok/s decode** at the time (all of it on an `-O0` build, unknowingly), beating the Swift/Metal reference's 5.1-6.3 tok/s on an M2 Air. With the build fixed and re-measured 2026-08-31: **9.9 tok/s at 24 slots, 16.2 at 44**. See Performance.
 
 ```powershell
 .\build\turbo-winfare.exe --prompt "What is the capital of France?"
-#   -> The capital of France is **Paris**.   (~8.8 tok/s decode)
+#   -> The capital of France is **Paris**.   (~9.9 tok/s decode at 24 slots)
 ```
 
 ## Parity with the reference -- what is actually missing
@@ -220,7 +300,7 @@ reference; in progress, roughly in this order:
 | Runtime integrity verification, symlink rejection | not started |
 | Expert-cache opt-in above 44 slots (descriptor heap derived from slot count) | **done** |
 | GUI/HTTP reload actually applying slots/context | **done** -- `/api/load_model` used to discard them |
-| Chunked/batched prefill (~5.7 tok/s here vs ~28 in the reference) | deferred |
+| Chunked/batched prefill (~7.6 tok/s here vs ~28 in the reference) | deferred |
 | FP16 KV and context above 4096 | deferred |
 
 `chat_template.jinja` ships in the bundle and is never read -- the template is hardcoded C++
@@ -245,20 +325,79 @@ auto-sized expert cache; the breakdown below prints on every CLI run.
 Reference points: M2 Air 5.1-6.3 tok/s; our 16-slot config (the 16 GB Legion Go S target)
 reaches **6.54 tok/s**, so the reference is beaten on the constrained configuration too.
 
+**Every row above was measured on an `-O0` build** (see Build & test). They are kept because
+their *relative* gains are what the table is for and those still hold -- each was an A/B against
+the row above it on the same binary. Do not compare them against anything measured after
+2026-08-31.
+
+### The `-O0` -> `-O3` measurement (2026-08-31)
+
+Interleaved A/B/A/B, 3 rounds, idle machine, disk queue confirmed 0, page cache warm. Same
+source, two build directories differing only in `CMAKE_CXX_FLAGS_RELEASE`. Medians:
+
+| | `-O0` | `-O3` | change |
+|---|---|---|---|
+| CPU reference (`--cpu`, s/forward pass) | 8.71 | **2.31** | **3.8x faster** |
+| Decode, `--slots 24` | 9.01 tok/s | **9.48** | +5.2% |
+| Decode, `--slots 44` | 14.96 tok/s | **16.09** | +7.6% |
+| Prefill, `--slots 44` | 7.17 tok/s | **7.58** | +5.7% |
+| CPU-other bucket, `--slots 44` | 7.98 ms | **3.86** | -52% |
+
+The shape is what the phase breakdown predicts and is worth internalizing before optimizing
+anything else here: decode is ~41% expert I/O and ~50% GPU wait, so **compiler optimization
+buys single digits on the GPU path and nothing structural**. It is the `--cpu` reference --
+pure scalar C++ with no I/O and no GPU -- that moves 3.8x. `--cpu` is now ~0.43 tok/s
+(2.3 s/token), not the ~0.1 tok/s previously documented.
+
+**Two workload traps caught while measuring this**, both of which produced wrong numbers first:
+
+1. **`--max-tokens 120` does not give you 120 tokens.** `"What is the capital of France?"`
+   stops at end-of-turn after 8, so the budget never binds and the run is an 8-token workload
+   wearing a 120-token label. The giveaway was cache hit rates identical to the 24-token runs.
+   Use an open-ended prompt and **check `over N forward passes`** in the output: 144 passes is
+   a real 120-token decode, 28 is not.
+2. **Absolute decode figures below are not comparable to the Stage 4 table above**, and not
+   only because of `-O0`. This machine now auto-sizes to 32 slots, which means it reports
+   >= 30 GB installed where the Stage 4 box was 24 GB. More RAM changes the page-cache
+   competition that the whole `--slots` argument rests on -- see below.
+
 ### Trading RAM for speed (`--slots`) -- opt-in, defaults unchanged
 
 The auto-size ladder (16/24/32 slots at <=16/<=24/>=32 GB) is deliberately conservative and
 stays that way; raising the cache is an explicit opt-in via `--slots N` or the GUI sidebar
 followed by a model reload. Interleaved, 120 tokens, idle machine:
 
+Original measurement, 24 GB box, `-O0` build:
+
 | slots | pool | peak RSS | cache hit | decode |
 |---|---|---|---|---|
-| 24 (auto here) | 2.3 GB | 4.3 GB | 64.8% | **7.0** |
+| 24 (auto there) | 2.3 GB | 4.3 GB | 64.8% | **7.0** |
 | 44 | 4.1 GB | 6.2 GB | 82.7% | **9.2** |
 | 64 | 6.0 GB | ~8.1 GB | 90.3% | 7.8-8.9 |
 
-**~+30% for ~2 GB.** 64 slots is *not* faster despite a 90% hit rate -- the pool competes with
-the OS page cache for the same physical memory, which is also why the ladder stops at 32.
+Re-measured 2026-08-31 on `-O3`, >= 30 GB installed, interleaved (not swept in order), 3
+rounds, 120 real decode tokens confirmed by `over 144 forward passes`:
+
+| slots | pool | cache hit | decode (median of 3) |
+|---|---|---|---|
+| 16 | 1.5 GB | 56.8% | 7.54 |
+| 24 | 2.3 GB | 69.5% | 9.87 |
+| 32 (auto here) | 3.1 GB | 72.2% | ~14 |
+| 44 | 4.1 GB | 86.3% | **16.20** |
+| 64 | 6.0 GB | 92.0% | **17.38** |
+
+Hit rates line up with the original within a couple of points, so the workload is comparable.
+Peak RSS was not re-measured -- nothing in this work changed an allocation size.
+
+**The "64 slots is not faster" finding no longer holds on this machine, and that is a
+statement about the machine, not about the code.** 64 was slower than 44 on the 24 GB box
+because a 6 GB pool squeezed the OS page cache the streamer deliberately leans on. With
+>= 30 GB there is room for both, and 64 is now the fastest configuration measured. The
+underlying claim -- that the pool competes with the page cache and more is not automatically
+better -- is unchanged; where the crossover sits is a property of installed RAM. **The
+auto-size ladder still stops at 32 and should stay there:** it has to be safe on the 16 GB
+Legion Go S, where the original finding still applies exactly as written.
+
 Footprint is `1.29 GB resident + KV + slots * 30 * 3.2 MB`.
 
 Two ceilings bound it, both now reported at startup rather than later:
@@ -272,7 +411,13 @@ Two ceilings bound it, both now reported at startup rather than later:
   real cap on UMA allocation, not installed RAM. Overshooting it does not degrade, it fails --
   and it used to surface as an unrelated-looking `Failed to map ...` far downstream.
 
-**Where the time goes now:** ~34% expert I/O, ~41% GPU wait, ~9% LM head, ~16% CPU. The
+**Where the time goes now:** ~41% expert I/O, ~50% GPU wait, ~9% other CPU, with the
+LM head accounting for ~10% that *spans* the GPU-wait and CPU buckets rather than
+forming a fourth one. The three buckets are disjoint and sum to 100%; the LM head is a
+single `submit_and_wait`, so its fence is inside "GPU wait" and its recording inside
+"CPU other". Counting it as a peer double-counted the fence and drove the residual
+negative -- the CLI printed `CPU other: -2.16 ms (-1.93%)` once the optimized build shrank
+real CPU work below the size of the overlap. The
 engine is still nowhere near compute- or DRAM-bound (Stage 3 measured 0.2% of peak ALU and
 ~6% of DRAM bandwidth), so the remaining headroom is in kernel efficiency, not hardware.
 
@@ -353,12 +498,29 @@ Suspicion, unconfirmed: allocation pressure when the previous process's multi-GB
 has not been reclaimed yet. Note expert slot buffers are SRV-only and so may fall back to an
 UPLOAD heap (see `create_uma_buffer`), which lets the pool over-commit and fail elsewhere.
 
+**2026-08-31 -- still not reproduced, but the instrumentation to catch it now exists.** 14
+consecutive `-O3` runs alternating `--slots 24` and `--slots 64` at 120 tokens: all exit 0,
+**zero UPLOAD-heap fallbacks**. That does not clear the suspicion, it just means the pool never
+came close to the budget on this machine (>= 30 GB installed, 16 GB adapter shared-memory
+budget). Three things changed that make a future occurrence diagnosable rather than mysterious:
+
+- The UPLOAD fallback is no longer silent. It warns on the first occurrence naming the buffer
+  and size, counts every one, and reports the count as `memory.uma_upload_fallbacks` in
+  `/api/telemetry`. **If that number is not 0, believe it before any other theory.**
+- Every discarded HRESULT on the submit path is checked, and failures name
+  `GetDeviceRemovedReason()`. A lost device used to keep the engine running -- see the
+  D3D12Context notes below.
+- `fetch_misses` had a genuine memory-corruption path on its failure branch (in-flight reads
+  abandoned without draining). That is fixed, and while it needs a *failed read* to trigger --
+  which none of these runs had -- it is exactly the shape of latent bug that produces an
+  unexplained 139.
+
 ### Not yet done
 
 Deferred deliberately; each would need the token-for-token gate re-run: FP16 activations
 (halves activation bandwidth, but changes numerics enough to cost us that gate), lane
 occupancy on routed `down_proj` (34% -- only 11 of 32 lanes busy), kernel fusion, and batched
-prefill with RDNA3 WMMA. Prefill is currently ~5.7 tok/s and is the reference's weak spot too
+prefill with RDNA3 WMMA. Prefill is currently ~7.6 tok/s and is the reference's weak spot too
 (~28 tok/s), so it is the biggest remaining opportunity.
 
 Context can go above 4096 only after `ATTN_MAX_SPAN` in [shaders/Attention.hlsl](shaders/Attention.hlsl)
@@ -370,7 +532,7 @@ an online-softmax rewrite that never materializes the full score span.
 #   -> The capital of France is **Paris**.
 ```
 
-~0.1 tok/s (roughly 14 s/token), which is expected: it is a single-threaded reference whose
+~0.43 tok/s (2.3 s/token; it was ~0.1 tok/s before the build was fixed), which is expected: it is a single-threaded reference whose
 job is to be right, not fast. `--dump-tensors <dir>` writes per-stage FP32 tensors for the
 first token (`embed`, `layerN_hidden`, `final_norm`, `logits`) so Stage 3 can diff each
 kernel against it. Other flags: `--max-tokens`, `--temperature` (0 = greedy).

@@ -18,6 +18,10 @@
 #include <thread>
 #include <vector>
 
+// Last include on purpose: check.hpp redefines assert so it survives NDEBUG, and <cassert>
+// (pulled in by anything included after it) would silently define assert back to a no-op.
+#include "check.hpp"
+
 #pragma comment(lib, "ws2_32.lib")
 
 using namespace gturbo;

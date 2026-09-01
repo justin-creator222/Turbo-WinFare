@@ -265,6 +265,236 @@ int main(int argc, char** argv) {
         dump_blob.insert(dump_blob.end(), got.begin(), got.end());
     }
 
+    // --- The production binding shape: one buffer as t0/t1/t2, non-zero offsets ----
+    //
+    // Every GEMV case above passes 0 for w_off/s_off/b_off/x_off/out_off/row_base and binds
+    // three separate buffers. The engine never does that. `resident.bin` is a single UMA
+    // buffer bound as {RES, RES, RES, x} with three different byte offsets into it
+    // (src/runner.cpp), each 16 KB-aligned, and the LM head's 262,144 rows are dispatched in
+    // 65,535-row chunks with row_base > 0. So the offset arithmetic in gemv_int4_row_lane --
+    // the arithmetic most likely to be got wrong by a refactor, and the arithmetic that
+    // decides which expert's weights a routed GEMV actually reads -- had no coverage at all.
+    //
+    // The unused space is poisoned rather than zeroed on purpose: reading a zeroed hole
+    // yields 0 and can look like a plausible small activation, while 0xCD yields obvious
+    // garbage.
+    constexpr size_t kResidentAlign = 16 * 1024;   // GTurboFormatV1::ALIGNMENT_BYTES
+    auto align_up = [](size_t v) {
+        return (v + kResidentAlign - 1) / kResidentAlign * kResidentAlign;
+    };
+
+    // Lays a QuantMatrix out the way the converter lays out resident.bin, and returns the
+    // buffer plus the three byte offsets. The first tensor deliberately does NOT start at 0.
+    struct Packed {
+        ComPtr<ID3D12Resource> buf;
+        uint32_t w_off{0}, s_off{0}, b_off{0};
+    };
+    auto pack_resident = [&](const QuantMatrix& m, const char* name) {
+        const size_t w_off = kResidentAlign;
+        const size_t s_off = align_up(w_off + m.packed.size());
+        const size_t b_off = align_up(s_off + m.scales.size() * 2);
+        const size_t total = align_up(b_off + m.biases.size() * 2);
+
+        std::vector<uint8_t> blob(total, 0xCD);
+        std::memcpy(blob.data() + w_off, m.packed.data(), m.packed.size());
+        std::memcpy(blob.data() + s_off, m.scales.data(), m.scales.size() * 2);
+        std::memcpy(blob.data() + b_off, m.biases.data(), m.biases.size() * 2);
+
+        Packed out;
+        out.buf = upload(*ctx, blob.data(), blob.size(), name);
+        out.w_off = static_cast<uint32_t>(w_off);
+        out.s_off = static_cast<uint32_t>(s_off);
+        out.b_off = static_cast<uint32_t>(b_off);
+        return out;
+    };
+
+    // Activations at a non-zero offset too, since PostAttn/LayerTail write several views
+    // into shared scratch and the kernels index them by offset.
+    constexpr uint32_t kXOff = 4096;
+    constexpr uint32_t kOutOff = 2048;
+    auto pack_activations = [&](const std::vector<float>& x, const char* name) {
+        std::vector<uint8_t> blob(kXOff + x.size() * 4, 0xCD);
+        std::memcpy(blob.data() + kXOff, x.data(), x.size() * 4);
+        return upload(*ctx, blob.data(), blob.size(), name);
+    };
+
+    // Offsets must be BIT-IDENTICAL to the same maths at offset zero, not merely close.
+    //
+    // Comparing the offset run against the CPU instead would be a weaker test and a flakier
+    // one. A 2,816-term FP32 dot product whose terms are of order 1 and whose result lands
+    // near zero through cancellation has an absolute error floor well above this file's 1e-5
+    // atol -- the first draft of this test failed on exactly one such row (0.0109138 against
+    // 0.0109309) with nothing wrong. Relocating a tensor cannot change the arithmetic at
+    // all, so equality is both the correct assertion and the one with no tolerance to argue
+    // about. It also catches an offset that is wrong by less than a rounding error, which a
+    // tolerance-based check never would.
+    auto report_identical = [&](const char* label, const std::vector<float>& a,
+                                const std::vector<float>& b) {
+        size_t bad = 0, first = 0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            if (std::memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+                if (bad == 0) first = i;
+                ++bad;
+            }
+        }
+        std::cout << (bad == 0 ? "  [PASS] " : "  [FAIL] ") << label;
+        if (bad) {
+            std::cout << "  " << bad << " of " << a.size() << " rows differ; first at ["
+                      << first << "] offset=" << a[first] << " zero-offset=" << b[first];
+            ok = false;
+        }
+        std::cout << "\n";
+    };
+
+    // --- GemvInt4 at production offsets, in two row chunks -----------------------
+    {
+        const uint32_t rows = 200, in_dim = 2816;
+        QuantMatrix m;
+        m.build(rows, in_dim, 4, rng);
+        std::vector<float> x(in_dim);
+        for (auto& v : x) v = xf(rng);
+
+        // Reference run: three separate buffers, every offset zero, one dispatch.
+        auto bw = upload(*ctx, m.packed.data(), m.packed.size(), "w_base");
+        auto bs = upload(*ctx, m.scales.data(), m.scales.size() * 2, "s_base");
+        auto bb = upload(*ctx, m.biases.data(), m.biases.size() * 2, "b_base");
+        auto bxz = upload(*ctx, x.data(), x.size() * 4, "x_base");
+        auto boz = ctx->create_uma_buffer(rows * 4, "out_base");
+        {
+            KernelDispatchParams p{};
+            p.grid_x = rows;
+            p.set({rows, in_dim, 0, 0, 0, 0, 0, 0});
+            run(KernelType::GemvInt4, {bw.Get(), bs.Get(), bb.Get(), bxz.Get()},
+                {boz.Get()}, p);
+        }
+        auto want_gpu = readback(boz, rows);
+
+        // Production run: one buffer bound as t0/t1/t2 at three 16 KB-aligned offsets, x and
+        // out offset too, and the rows split into chunks the way the LM head is. 128 stands
+        // in for the 65,535 cap so row_base runs without a 262,144-row dispatch; the second
+        // chunk is deliberately short, which is what exercises the `row >= rows` early out.
+        Packed w = pack_resident(m, "resident_int4");
+        auto bx = pack_activations(x, "x_off");
+        auto bo = ctx->create_uma_buffer(kOutOff + rows * 4, "out_off");
+
+        constexpr uint32_t kChunk = 128;
+        for (uint32_t base = 0; base < rows; base += kChunk) {
+            KernelDispatchParams p{};
+            p.grid_x = std::min(kChunk, rows - base);
+            p.set({rows, in_dim, w.w_off, w.s_off, w.b_off, kXOff, kOutOff, base});
+            run(KernelType::GemvInt4, {w.buf.Get(), w.buf.Get(), w.buf.Get(), bx.Get()},
+                {bo.Get()}, p);
+        }
+        auto all = readback(bo, kOutOff / 4 + rows);
+        std::vector<float> got(all.begin() + kOutOff / 4, all.end());
+
+        report_identical("GemvInt4  (shared buffer t0/t1/t2, offsets, 2 row chunks)",
+                         got, want_gpu);
+        // Deliberately no second CPU comparison here. GemvInt4's absolute correctness is
+        // already pinned by the 96-row case above; re-checking a different random matrix
+        // adds no coverage and only re-rolls the dice on cancellation. It was tried, and it
+        // failed on row 135 of 200 -- 0.0109138 against 0.0109309, a 1.7e-5 absolute
+        // disagreement in a 2,816-term FP32 sum whose terms are of order 1. The chain that
+        // matters is: zero-offset == CPU (96-row case), offset == zero-offset (here).
+    }
+
+    // --- GemvInt8 at production offsets -------------------------------------------
+    {
+        const uint32_t rows = 128, in_dim = 2816;   // the router shape
+        QuantMatrix m;
+        m.build(rows, in_dim, 8, rng);
+        std::vector<float> x(in_dim);
+        for (auto& v : x) v = xf(rng);
+
+        auto bw = upload(*ctx, m.packed.data(), m.packed.size(), "w8_base");
+        auto bs = upload(*ctx, m.scales.data(), m.scales.size() * 2, "s8_base");
+        auto bb = upload(*ctx, m.biases.data(), m.biases.size() * 2, "b8_base");
+        auto bxz = upload(*ctx, x.data(), x.size() * 4, "x8_base");
+        auto boz = ctx->create_uma_buffer(rows * 4, "out8_base");
+        {
+            KernelDispatchParams p{};
+            p.grid_x = rows;
+            p.set({rows, in_dim, 0, 0, 0, 0, 0, 0});
+            run(KernelType::GemvInt8, {bw.Get(), bs.Get(), bb.Get(), bxz.Get()},
+                {boz.Get()}, p);
+        }
+        auto want_gpu = readback(boz, rows);
+
+        Packed w = pack_resident(m, "resident_int8");
+        auto bx = pack_activations(x, "x_off8");
+        auto bo = ctx->create_uma_buffer(kOutOff + rows * 4, "out_off8");
+
+        KernelDispatchParams p{};
+        p.grid_x = rows;
+        p.set({rows, in_dim, w.w_off, w.s_off, w.b_off, kXOff, kOutOff, 0});
+        run(KernelType::GemvInt8, {w.buf.Get(), w.buf.Get(), w.buf.Get(), bx.Get()},
+            {bo.Get()}, p);
+
+        auto all = readback(bo, kOutOff / 4 + rows);
+        std::vector<float> got(all.begin() + kOutOff / 4, all.end());
+        report_identical("GemvInt8  (shared buffer t0/t1/t2, non-zero offsets)",
+                         got, want_gpu);
+    }
+
+    // --- LMHeadGreedy at production offsets ---------------------------------------
+    //
+    // The tied head reads the embedding matrix out of resident.bin at the same offsets
+    // EmbedLookup uses, so it has exactly this binding shape in the real dispatch graph.
+    {
+        const uint32_t rows = 4096, in_dim = 2816;
+        QuantMatrix m;
+        m.build(rows, in_dim, 4, rng);
+        std::vector<float> x(in_dim);
+        for (auto& v : x) v = xf(rng);
+
+        Packed w = pack_resident(m, "resident_head");
+        auto bx = pack_activations(x, "x_off_head");
+        auto bsum = ctx->create_uma_buffer(static_cast<uint64_t>(rows) * 8, "summaries_off");
+        auto btok = ctx->create_uma_buffer(4, "token_off");
+
+        constexpr uint32_t LMH_THREADS = 512;
+        constexpr uint32_t MIN_ROWS_PER_GROUP = LMH_THREADS / 64;
+        const uint32_t groups = (rows + MIN_ROWS_PER_GROUP - 1) / MIN_ROWS_PER_GROUP;
+
+        {
+            KernelDispatchParams p{};
+            p.grid_x = groups;
+            p.set({rows, in_dim, w.w_off, w.s_off, w.b_off, kXOff, 0, 0});
+            run(KernelType::LMHeadGreedy, {w.buf.Get(), w.buf.Get(), w.buf.Get(), bx.Get()},
+                {bsum.Get()}, p);
+        }
+        {
+            KernelDispatchParams p{};
+            p.grid_x = 1;
+            p.set({groups, 0, 0, 0});
+            run(KernelType::ArgmaxReduce, {bsum.Get()}, {btok.Get()}, p);
+        }
+
+        uint32_t got_tok = 0;
+        {
+            void* q = nullptr;
+            D3D12_RANGE r{0, 4};
+            btok->Map(0, &r, &q);
+            std::memcpy(&got_tok, q, 4);
+            btok->Unmap(0, nullptr);
+        }
+
+        auto logits = m.matvec(x);
+        uint32_t want_tok = 0;
+        for (uint32_t i = 1; i < rows; ++i) {
+            if (logits[i] > logits[want_tok]) want_tok = i;
+        }
+
+        const bool tok_ok = (got_tok == want_tok);
+        std::cout << (tok_ok ? "  [PASS] " : "  [FAIL] ")
+                  << "LMHeadGreedy (shared buffer t0/t1/t2, non-zero offsets)";
+        if (!tok_ok) {
+            std::cout << "  got=" << got_tok << " want=" << want_tok;
+            ok = false;
+        }
+        std::cout << "\n";
+    }
+
     // --- EmbedLookup: dequantize one row, scaled by sqrt(D) ---------------------
     {
         const uint32_t rows = 64, in_dim = 2816;

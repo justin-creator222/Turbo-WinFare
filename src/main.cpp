@@ -489,10 +489,15 @@ int main(int argc, char* argv[]) {
             std::cout << "  GPU wait:     " << metrics_fmt(m.gpu_wait_ms / tok) << " ms  ("
                       << metrics_fmt(100.0 * m.gpu_wait_ms / m.total_time_ms) << "%)  in "
                       << (m.gpu_waits / static_cast<uint64_t>(tok)) << " fences/token\n";
-            std::cout << "  LM head:      " << metrics_fmt(m.lm_head_ms / tok) << " ms  ("
-                      << metrics_fmt(100.0 * m.lm_head_ms / m.total_time_ms) << "%)\n";
             std::cout << "  CPU other:    " << metrics_fmt(m.cpu_other_ms / tok) << " ms  ("
                       << metrics_fmt(100.0 * m.cpu_other_ms / m.total_time_ms) << "%)\n";
+            // Printed after the three disjoint buckets, and indented, because it OVERLAPS
+            // them rather than adding to them: the head is a single submit_and_wait, so its
+            // fence is inside "GPU wait" and its recording is inside "CPU other". Listing it
+            // as a peer made the four percentages sum past 100%.
+            std::cout << "    of which LM head: " << metrics_fmt(m.lm_head_ms / tok) << " ms  ("
+                      << metrics_fmt(100.0 * m.lm_head_ms / m.total_time_ms)
+                      << "%, spans GPU wait + CPU other)\n";
             std::cout << "---------------- Expert streaming ------------------\n";
             std::cout << "  read:         " << metrics_fmt(io_mb / tok) << " MB/token, "
                       << io_mb << " MB total in " << m.total_io_calls << " reads\n";

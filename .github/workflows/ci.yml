@@ -31,12 +31,12 @@ jobs:
       - name: Configure
         run: |
           $env:PATH = "C:\w64devkit\bin;" + $env:PATH
-          cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=C:/w64devkit/bin/g++.exe
+          cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=C:/w64devkit/bin/g++.exe -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: |
           $env:PATH = "C:\w64devkit\bin;" + $env:PATH
-          cmake --build build --config Release
+          cmake --build build
 
       - name: Test
         # test_gpu_kernels is excluded deliberately: it creates a real D3D12 device and

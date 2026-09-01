@@ -290,6 +290,21 @@ void ForwardRunner::initialize() {
         throw GTurboFormatError("resident.bin declares no tensors; the bundle is a placeholder");
     }
     resident_weights_bytes_ = file_size;
+
+    // Probe the device once, here, now that the largest single allocation this engine makes
+    // has landed. An over-greedy UMA commitment is the most plausible way to lose the device
+    // on an APU, and a lost device does not announce itself -- fence waits start returning
+    // instantly and readbacks hand back stale bytes, so generation continues at an
+    // impressive tokens/sec producing nonsense. Failing at load is the difference between a
+    // clear error and a benchmark result nobody can explain.
+    if (ctx_ && !ctx_->device_ok()) {
+        throw GTurboFormatError(
+            "The D3D12 device was lost while loading resident weights: " +
+            ctx_->device_removed_reason() +
+            ". Lower --slots or --context; " +
+            std::to_string(resident_weights_bytes_ / (1024 * 1024)) +
+            " MB of resident weights had just been committed.");
+    }
 }
 
 ExpertStreamer* ForwardRunner::ensure_streamer_opened(int L) {
@@ -927,10 +942,17 @@ GenerationResult ForwardRunner::generate_tokens(const std::vector<uint32_t>& pro
         ? 0.0 : (prompt_tokens.size() / (prefill_ms / 1000.0));
     metrics_.decode_tokens_per_sec = (result.tokens.empty() || decode_ms <= 0.0)
         ? 0.0 : (result.tokens.size() / (decode_ms / 1000.0));
-    // Whatever is left after the three measured phases is CPU-side recording and readback.
-    // It is a residual, so it can go slightly negative when phases overlap.
+    // Expert I/O, GPU wait and this residual are DISJOINT and sum to the token.
+    //
+    // lm_head_ms is deliberately not subtracted here, because it is not a fourth peer bucket:
+    // the head is one submit_and_wait, so its cost already sits inside gpu_wait_ms (the fence)
+    // and inside this residual (the recording). Subtracting it as though it were disjoint
+    // double-counted the fence, which made the four figures sum to more than 100% and pushed
+    // this residual negative -- the CLI printed "CPU other: -2.16 ms (-1.93%)" once the
+    // optimized build shrank the real CPU work below the size of the overlap. The head is
+    // reported separately as an overlapping annotation instead.
     metrics_.cpu_other_ms = metrics_.total_time_ms - metrics_.expert_io_ms -
-                            metrics_.gpu_wait_ms - metrics_.lm_head_ms;
+                            metrics_.gpu_wait_ms;
 
     uint64_t io_bytes = 0, io_calls = 0;
     {

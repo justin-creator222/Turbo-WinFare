@@ -502,7 +502,14 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
                      << "\"system_total_ram_gb\":" << (sys_mem.total_system_ram_bytes / (1024.0 * 1024.0 * 1024.0)) << ","
                      << "\"system_avail_ram_gb\":" << (sys_mem.avail_system_ram_bytes / (1024.0 * 1024.0 * 1024.0)) << ","
                      << "\"gpu_vram_used_mb\":" << (sys_mem.gpu_dedicated_vram_used / (1024.0 * 1024.0)) << ","
-                     << "\"gpu_shared_used_mb\":" << (sys_mem.gpu_shared_ram_used / (1024.0 * 1024.0))
+                     << "\"gpu_shared_used_mb\":" << (sys_mem.gpu_shared_ram_used / (1024.0 * 1024.0)) << ","
+                     // Buffers that could not get host-coherent CUSTOM/L0 memory and fell
+                     // back to a write-combined UPLOAD heap. Non-zero means the adapter's
+                     // shared-memory budget is exhausted, which is the condition that has
+                     // been suspected behind the intermittent mid-run crash and could never
+                     // be checked while the fallback was silent. Any value above 0 is worth
+                     // acting on -- lower --slots or --context.
+                     << "\"uma_upload_fallbacks\":" << (tctx ? tctx->uma_fallback_count() : 0u)
                  << "},"
                  << "\"performance\":{"
                      << "\"prefill_toks_sec\":" << perf.prefill_tokens_per_sec << ","

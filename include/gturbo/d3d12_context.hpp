@@ -38,6 +38,17 @@ public:
     void wait_for_fence(uint64_t fence_value);
     void flush_gpu();
 
+    // True while the device is healthy. A removed device does NOT stop this engine on its
+    // own: GetCompletedValue() starts returning UINT64_MAX so every fence wait returns
+    // instantly, the router-index readback still maps and hands back stale bytes so the same
+    // eight experts look like cache hits every layer, and the greedy token readback returns
+    // whatever was there before. The result is a large tokens/sec number attached to garbage
+    // output -- a failure that reads as a performance win. Probe explicitly instead.
+    bool device_ok() const;
+
+    // Human-readable device-removal reason, or an empty string when the device is fine.
+    std::string device_removed_reason() const;
+
     // Memory Allocation Helper for UMA Host-Coherent RAM.
     //
     // `needs_uav` must be true for any buffer a shader will WRITE. It defaults to true
@@ -52,6 +63,10 @@ public:
     // for read-only buffers; a UAV-capable request fails loudly instead of downgrading.
     ComPtr<ID3D12Resource> create_uma_buffer(uint64_t size_bytes, const std::string& name = "",
                                              bool needs_uav = true);
+
+    // Number of UMA allocations that had to fall back to an UPLOAD heap. Non-zero means the
+    // host-coherent budget is under pressure; surfaced in /api/telemetry.
+    uint32_t uma_fallback_count() const { return uma_fallback_count_; }
 
     std::string adapter_name() const { return adapter_name_; }
     uint64_t dedicated_video_memory() const { return dedicated_vram_; }
@@ -69,6 +84,17 @@ public:
     SystemMemoryInfo query_memory_info() const;
 
 private:
+    // Throws a GTurboFormatError naming `where` when `hr` failed, folding in the device
+    // removal reason when there is one. Every D3D12 call that returns an HRESULT on the
+    // submit path goes through this -- Close(), Signal(), SetEventOnCompletion() and both
+    // Reset() calls used to discard theirs.
+    void throw_on_hr(HRESULT hr, const char* where) const;
+
+    // A single fence wait is one layer's dispatches; nothing here legitimately takes a
+    // minute. Waiting INFINITE meant a hung or removed device hung the process with it,
+    // leaving taskkill as the only way out.
+    static constexpr unsigned long kFenceWaitTimeoutMs = 60000;
+
     ComPtr<IDXGIFactory4> factory_;
     ComPtr<IDXGIAdapter1> adapter_;
     ComPtr<ID3D12Device> device_;
@@ -90,6 +116,10 @@ private:
     std::string adapter_name_;
     uint64_t dedicated_vram_{0};
     uint64_t shared_ram_{0};
+    // How many buffers fell back from the host-coherent CUSTOM/L0 heap to an UPLOAD heap.
+    // The fallback used to be completely silent, which is why it could be named as a suspect
+    // in the unexplained mid-benchmark crash and neither confirmed nor ruled out.
+    uint32_t uma_fallback_count_{0};
 };
 
 } // namespace gturbo
