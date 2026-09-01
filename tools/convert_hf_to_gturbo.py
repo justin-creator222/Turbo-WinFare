@@ -419,6 +419,33 @@ def plan_experts(tensors, num_layers, num_experts):
 # Streaming writer
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Machine-readable progress (--progress-json)
+#
+# The GUI drives this script as a subprocess and needs to report progress. It could scrape
+# the human-readable bar below, but that bar exists to be read by a person and its wording
+# is not a contract -- the first reflow of a label would break the GUI silently. One JSON
+# object per line is.
+#
+# Human output is left on stdout untouched in this mode; the reader ignores any line that is
+# not a JSON object, and keeps the most recent ones as context if the run fails.
+# ---------------------------------------------------------------------------
+PROGRESS_JSON = False
+
+
+def emit(**obj):
+    if not PROGRESS_JSON:
+        return
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def stage(step, steps, message):
+    """Prints a stage header, and emits it when --progress-json is on."""
+    print(f"[{step}/{steps}] {message}")
+    emit(event="stage", step=step, steps=steps, message=message)
+
+
 class Progress:
     def __init__(self, total, label):
         self.total, self.label, self.done = total, label, 0
@@ -435,6 +462,10 @@ class Progress:
         rate = self.done / elapsed / (1024 * 1024)
         pct = 100.0 * self.done / self.total if self.total else 100.0
         eta = (self.total - self.done) / (self.done / elapsed) if self.done else 0
+        if PROGRESS_JSON:
+            emit(event="progress", label=self.label, done=self.done, total=self.total,
+                 pct=round(pct, 2), rate_mbs=round(rate, 2), eta_s=int(eta))
+            return
         sys.stdout.write(
             f"\r    {self.label}: {pct:5.1f}%  {human(self.done)} / {human(self.total)}"
             f"  {rate:6.1f} MB/s  ETA {int(eta // 60):02d}:{int(eta % 60):02d}   ")
@@ -442,7 +473,8 @@ class Progress:
 
     def finish(self):
         self.advance(0)
-        sys.stdout.write("\n")
+        if not PROGRESS_JSON:
+            sys.stdout.write("\n")
 
 
 def stream_into(source, out, shard, src_start, nbytes, dst_offset, progress):
@@ -593,7 +625,7 @@ def convert(source, out_dir, skip_hash=False, resume=False):
     (partial / "tokenizer").mkdir(parents=True, exist_ok=True)
 
     # --- 1. Source metadata -------------------------------------------------
-    print("[1/6] Reading checkpoint metadata...")
+    stage(1, 6, "Reading checkpoint metadata...")
     cfg = json.loads(source.read_all(CONFIG_FILE))
     index_raw = source.read_all(INDEX_FILE)
     index_sha = hashlib.sha256(index_raw).hexdigest()
@@ -618,7 +650,7 @@ def convert(source, out_dir, skip_hash=False, resume=False):
           f"{excluded} multimodal (excluded)")
 
     # --- 3. Plan ------------------------------------------------------------
-    print("[2/6] Planning layout...")
+    stage(2, 6, "Planning layout...")
     entries = group_resident(resident_src)
     index_size, resident_size = plan_resident(entries)
     block, expert_stride, block_raw, per_layer_src = plan_experts(
@@ -632,7 +664,7 @@ def convert(source, out_dir, skip_hash=False, resume=False):
           f"{human(layer_bytes * num_layers)}")
 
     # --- 4. Resident --------------------------------------------------------
-    print("[3/6] Writing resident.bin...")
+    stage(3, 6, "Writing resident.bin...")
     resident_path = partial / "resident.bin"
     prog = Progress(resident_size - index_size, "resident")
     with open(resident_path, "r+b" if resident_path.exists() else "wb") as f:
@@ -650,7 +682,7 @@ def convert(source, out_dir, skip_hash=False, resume=False):
     prog.finish()
 
     # --- 5. Experts ---------------------------------------------------------
-    print("[4/6] Writing packed_experts/...")
+    stage(4, 6, "Writing packed_experts/...")
     # Payload bytes per layer = every expert's nine sub-tensors, excluding stride padding.
     payload_per_layer = block_raw * num_experts
     prog = Progress(payload_per_layer * num_layers, "experts")
@@ -681,7 +713,7 @@ def convert(source, out_dir, skip_hash=False, resume=False):
         m.unlink()
 
     # --- 6. Tokenizer + manifest -------------------------------------------
-    print("[5/6] Copying tokenizer...")
+    stage(5, 6, "Copying tokenizer...")
     for name, required in TOKENIZER_FILES:
         try:
             data = source.read_all(name)
@@ -693,7 +725,7 @@ def convert(source, out_dir, skip_hash=False, resume=False):
         (partial / "tokenizer" / name).write_bytes(data)
         print(f"    {name} ({len(data):,} B)")
 
-    print("[6/6] Writing layout.json + manifest.json...")
+    stage(6, 6, "Writing layout.json + manifest.json...")
     layout = {
         "expertStride": expert_stride,
         "numLayers": num_layers,
@@ -755,17 +787,34 @@ def main():
                     help="reuse a previous interrupted <output>.partial")
     ap.add_argument("--skip-hash", action="store_true",
                     help="record file sizes without sha256 (faster, weaker manifest)")
+    ap.add_argument("--progress-json", action="store_true",
+                    help="emit one JSON progress object per line (used by the GUI)")
     args = ap.parse_args()
+
+    global PROGRESS_JSON
+    PROGRESS_JSON = args.progress_json
 
     source = LocalSource(args.input) if args.input else RemoteSource(args.token)
     print(f"Source: {args.input if args.input else REPO_ID + ' @ ' + REVISION[:12]}")
     print(f"Output: {args.output}\n")
 
+    emit(event="start", output=args.output,
+         source=(args.input if args.input else REPO_ID))
     try:
         convert(source, args.output, skip_hash=args.skip_hash, resume=args.resume)
     except KeyboardInterrupt:
         print("\nInterrupted. Re-run with --resume to continue.", file=sys.stderr)
+        emit(event="cancelled", message="Interrupted. Re-run with Resume to continue.")
         return 130
+    except SystemExit as ex:
+        # argparse and the explicit SystemExit raises inside convert() both land here. The
+        # GUI needs the reason, not just a non-zero exit code.
+        emit(event="error", message=str(ex))
+        raise
+    except Exception as ex:
+        emit(event="error", message=f"{type(ex).__name__}: {ex}")
+        raise
+    emit(event="done", output=args.output)
     return 0
 
 

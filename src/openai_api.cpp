@@ -197,23 +197,9 @@ bool validate_chat_request(const JsonValue& body, const OpenAIServerConfig& cfg,
     o.max_tokens = static_cast<int>(std::min<int64_t>(max_tokens, cfg.max_context));
 
     // --- stop: a string or an array of at most four ----------------------------------
-    if (body.has("stop")) {
-        const JsonValue& s = body.object_value.at("stop");
-        if (s.type == JsonValue::Type::String) {
-            o.stop_strings.push_back(s.string_value);
-        } else if (s.is_array()) {
-            if (s.array_value.size() > kMaxStopStrings) {
-                return fail(err, 400, "At most 4 stop sequences are supported.", "stop");
-            }
-            for (const auto& e : s.array_value) {
-                if (e.type != JsonValue::Type::String) {
-                    return fail(err, 400, "Stop sequences must be strings.", "stop");
-                }
-                o.stop_strings.push_back(e.string_value);
-            }
-        } else if (!s.is_null()) {
-            return fail(err, 400, "'stop' must be a string or an array of strings.", "stop");
-        }
+    if (const std::string stop_err = parse_stop_field(body, kMaxStopStrings, o.stop_strings);
+        !stop_err.empty()) {
+        return fail(err, 400, stop_err, "stop");
     }
 
     out.stream = body.bool_or("stream", false);
@@ -226,6 +212,30 @@ bool validate_chat_request(const JsonValue& body, const OpenAIServerConfig& cfg,
 
 // ---------------------------------------------------------------------------
 // Rendering
+
+std::string parse_stop_field(const JsonValue& body, size_t max_stops,
+                             std::vector<std::string>& out) {
+    if (!body.has("stop")) return "";
+    const JsonValue& s = body.object_value.at("stop");
+    if (s.type == JsonValue::Type::String) {
+        out.push_back(s.string_value);
+        return "";
+    }
+    if (s.is_array()) {
+        if (s.array_value.size() > max_stops) {
+            return "At most " + std::to_string(max_stops) + " stop sequences are supported.";
+        }
+        for (const auto& e : s.array_value) {
+            if (e.type != JsonValue::Type::String) {
+                return "Stop sequences must be strings.";
+            }
+            out.push_back(e.string_value);
+        }
+        return "";
+    }
+    if (s.is_null()) return "";
+    return "'stop' must be a string or an array of strings.";
+}
 
 std::string render_error(const ApiError& err) {
     std::ostringstream o;
@@ -278,14 +288,20 @@ std::string render_chunk(const std::string& id, const std::string& model, int64_
 }
 
 std::string render_final_chunk(const std::string& id, const std::string& model, int64_t created,
-                               StopReason reason) {
+                               const GenerationResult& result) {
     std::ostringstream o;
     o << "{\"id\":" << JsonValue::quote(id) << ","
       << "\"object\":\"chat.completion.chunk\","
       << "\"created\":" << created << ","
       << "\"model\":" << JsonValue::quote(model) << ","
       << "\"choices\":[{\"index\":0,\"delta\":{},"
-      << "\"finish_reason\":\"" << finish_reason_for(reason) << "\"}]}";
+      << "\"finish_reason\":\"" << finish_reason_for(result.reason) << "\"}],"
+      << "\"x_turbo\":{"
+      << "\"stop_reason\":" << JsonValue::quote(stop_reason_name(result.reason)) << ","
+      << "\"matched_stop\":"
+      << (result.matched_stop.empty() ? "null" : JsonValue::quote(result.matched_stop)) << ","
+      << "\"ttft_ms\":" << result.ttft_ms
+      << "}}";
     return o.str();
 }
 

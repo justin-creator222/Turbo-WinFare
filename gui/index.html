@@ -6,7 +6,11 @@
     <title>Turbo-WinFare | Native DirectX 12 Inference Engine</title>
     <link rel="icon" type="image/svg+xml" href="logo.svg">
     <link rel="stylesheet" href="styles.css">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <!-- No webfont link here on purpose. This is a local inference engine that is
+         useful with no network at all, and a stylesheet from fonts.googleapis.com
+         blocks first paint until it resolves -- so on an offline or air-gapped
+         machine the GUI hung on a DNS timeout before rendering anything. The stacks
+         in styles.css are system fonts that ship with Windows 11. -->
 </head>
 <body>
     <div id="app">
@@ -70,7 +74,11 @@
                             <option value="none">⏱ None — fastest first token</option>
                         </select>
                     </div>
-                    <textarea id="sys-prompt-input" rows="1" placeholder="Custom system instructions...">You are a helpful, knowledgeable assistant. Answer the question that was asked, directly and without preamble. Match length to the question: one sentence when that is enough, more when the topic needs it. If you do not know something or are uncertain, say so plainly instead of guessing.</textarea>
+                    <!-- Seeded by restoreSystemPrompt() from localStorage, falling back
+                         to SYSTEM_PRESETS.default in app.js. The default persona used to
+                         be duplicated here verbatim as well, so the two copies could
+                         drift apart with nothing to catch it. -->
+                    <textarea id="sys-prompt-input" rows="1" oninput="persistSystemPrompt(); updateContextUsage();" placeholder="Custom system instructions..."></textarea>
                 </div>
 
                 <!-- Chat Transcript Area -->
@@ -96,7 +104,7 @@
                         <div class="preset-chip" onclick="usePreset('Compare LFU vs LRU expert cache eviction policies for 16GB UMA laptops:')">📊 Cache Eviction Analysis</div>
                     </div>
                     <div class="input-box-wrapper">
-                        <textarea id="prompt-input" placeholder="Type a prompt or instruction... (Shift+Enter for new line)" rows="1" onkeydown="handleKeyDown(event)"></textarea>
+                        <textarea id="prompt-input" oninput="updateContextUsage()" placeholder="Type a prompt or instruction... (Shift+Enter for new line)" rows="1" onkeydown="handleKeyDown(event)"></textarea>
                         <div class="action-buttons">
                             <button class="btn-clear" title="Clear Transcript" onclick="clearTranscript()">🧹</button>
                             <button class="btn-send" id="btn-send" onclick="sendPrompt()">➔</button>
@@ -123,9 +131,10 @@
                         <div class="control-item">
                             <label class="control-header">Available Model Bundles</label>
                             <div class="model-select-row">
-                                <select id="model-select">
-                                    <option value="gemma-4-26b-a4b.gturbo">gemma-4-26b-a4b.gturbo (Active)</option>
-                                </select>
+                                <!-- Deliberately empty: refreshModelList() fills this from
+                                     GET /api/models. A hardcoded entry here claimed a model
+                                     was Active before any request had been made. -->
+                                <select id="model-select"></select>
                                 <button class="btn-icon" title="Refresh List" onclick="refreshModelList()">🔄</button>
                             </div>
                         </div>
@@ -135,13 +144,89 @@
                             <button class="btn-danger" onclick="unloadModel()">🔴 Unload</button>
                         </div>
 
+                        <!-- Shown by showNoModelHelp() when no bundle on disk parses. -->
+                        <div class="no-model-help" id="no-model-help" style="display:none;">
+                            <strong>No model bundle found.</strong>
+                            <p>The engine searches the working directory, the folder holding
+                               the executable, and one level above it, and lists only bundles
+                               whose <code>manifest.json</code> and
+                               <code>packed_experts/layout.json</code> actually parse.
+                               Use <em>Get a model</em> below to build one.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Model acquisition. Drives tools/convert_hf_to_gturbo.py server-side: it
+                     streams the pinned checkpoint and repacks it into a .gturbo bundle. -->
+                <div class="panel-section" id="panel-download">
+                    <div class="section-title">Get a Model</div>
+                    <div class="control-group">
+                        <div class="download-intro">
+                            Downloads the pinned revision of
+                            <code>mlx-community/gemma-4-26b-a4b-it-4bit</code> and repacks it
+                            locally. Nothing is re-quantized &mdash; every value is copied
+                            through byte for byte.
+                        </div>
+
+                        <!-- Filled by renderDownloadPrereqs() from /api/server_info. -->
+                        <div class="prereq-list" id="download-prereqs"></div>
+
+                        <div class="control-item">
+                            <label class="control-header"><span>Bundle name</span></label>
+                            <input type="text" id="dl-output" value="gemma-4-26b-a4b.gturbo"
+                                   spellcheck="false">
+                            <div class="control-hint">
+                                Created in the server's working directory. Letters, digits,
+                                <code>.</code>, <code>-</code> and <code>_</code> only, ending
+                                in <code>.gturbo</code>.
+                            </div>
+                        </div>
+
+                        <div class="control-item">
+                            <label class="control-header"><span>HuggingFace token</span></label>
+                            <input type="password" id="dl-token" placeholder="optional"
+                                   autocomplete="off" spellcheck="false">
+                            <div class="control-hint">
+                                Only needed if the repository is gated. Accept the licence at
+                                <code>huggingface.co/mlx-community/gemma-4-26b-a4b-it-4bit</code>
+                                first. The token is sent to this local server, passed to the
+                                converter through its environment, and never stored or logged.
+                            </div>
+                        </div>
+
+                        <div class="control-item">
+                            <label class="checkbox-row">
+                                <input type="checkbox" id="dl-resume">
+                                <span>Resume a previous interrupted download</span>
+                            </label>
+                        </div>
+
+                        <div class="btn-row">
+                            <button class="btn-primary" id="dl-start"
+                                    onclick="startDownload()">⬇ Download &amp; Convert</button>
+                            <button class="btn-danger" id="dl-cancel" style="display:none;"
+                                    onclick="cancelDownload()">■ Cancel</button>
+                        </div>
+
+                        <div class="dl-progress" id="dl-progress" style="display:none;">
+                            <div class="dl-stage" id="dl-stage">&#8212;</div>
+                            <div class="dl-bar"><div class="dl-fill" id="dl-fill"></div></div>
+                            <div class="dl-meta" id="dl-meta">&#8212;</div>
+                        </div>
+
+                        <div class="dl-result" id="dl-result" style="display:none;"></div>
+
                         <!-- Active Model Metadata Card -->
                         <div class="metadata-card" id="model-meta-card">
                             <div class="meta-row"><span>Status:</span> <strong id="meta-status" style="color:#f87171">UNLOADED</strong></div>
-                            <div class="meta-row"><span>Model ID:</span> <span id="meta-id">gemma-4-26b-a4b</span></div>
-                            <div class="meta-row"><span>Architecture:</span> <span id="meta-arch">30 Layers • 128 Experts</span></div>
-                            <div class="meta-row"><span>Routed Top-K:</span> <span id="meta-topk">8 Experts / Token</span></div>
-                            <div class="meta-row"><span>Quantization:</span> <span id="meta-quant">MLX affine Int4, group 64 (16KB Sector Aligned)</span></div>
+                            <!-- Every row below is written by updateModelMeta() from
+                                 GET /api/models. They were hardcoded and no code path ever
+                                 wrote them, so they described the default bundle's
+                                 architecture whatever was actually loaded. -->
+                            <div class="meta-row"><span>Model ID:</span> <span id="meta-id">&#8212;</span></div>
+                            <div class="meta-row"><span>Architecture:</span> <span id="meta-arch">&#8212;</span></div>
+                            <div class="meta-row"><span>Routed Top-K:</span> <span id="meta-topk">&#8212;</span></div>
+                            <div class="meta-row"><span>Quantization:</span> <span id="meta-quant">&#8212;</span></div>
                         </div>
                     </div>
                 </div>
@@ -203,8 +288,16 @@
                     </div>
                 </div>
 
+                <!-- Shown by markConfigStale() when GET /api/config could not be read. The
+                     values in the two panels below are pre-hydration placeholders; without
+                     this banner a failed hydrate left them on screen looking authoritative. -->
+                <div class="stale-notice" id="config-stale-notice" style="display:none;">
+                    Could not read the engine's configuration. The values below are defaults,
+                    not what the engine is running.
+                </div>
+
                 <!-- Memory & UMA DRAM Cache Settings -->
-                <div class="panel-section">
+                <div class="panel-section" id="panel-memory">
                     <div class="section-title">Memory & DRAM Cache Controls</div>
                     <div class="control-group">
                         <div class="control-item">
@@ -219,6 +312,11 @@
                                  which is capped at 32 KB. The list used to offer 8192 and
                                  default to 62000, neither of which the engine can initialize.
                                  These entries are only the pre-hydration fallback. -->
+                            <!-- Live prompt-token estimate against the engine's resolved
+                                 context, written by updateContextUsage(). The conversation
+                                 array grew unbounded with nothing to warn the user before a
+                                 request overran the window. -->
+                            <div class="context-usage" id="context-usage">&#8212;</div>
                             <select id="cfg-context" onchange="updateConfig()">
                                 <option value="512">512 Tokens</option>
                                 <option value="1024">1024 Tokens</option>
@@ -260,7 +358,7 @@
                 </div>
 
                 <!-- Generation Hyperparameters -->
-                <div class="panel-section">
+                <div class="panel-section" id="panel-generation">
                     <div class="section-title">Generation Parameters</div>
                     <div class="control-group">
                         <div class="control-item">
@@ -297,11 +395,119 @@
                     </div>
                 </div>
 
+                <!-- Sampling controls the engine has always supported and the GUI never
+                     exposed. All three reach the engine through /v1/chat/completions and are
+                     also stored as defaults via POST /api/config. -->
+                <div class="panel-section" id="panel-sampling">
+                    <div class="section-title">Sampling &amp; Determinism</div>
+                    <div class="control-group">
+                        <div class="control-item">
+                            <div class="control-header">
+                                <span>Repetition Penalty</span>
+                                <span class="val" id="val-reppen">1.00</span>
+                            </div>
+                            <!-- Applied to the already-softcapped logits. Applied to raw
+                                 logits it is very nearly a no-op, because real Gemma 4 logits
+                                 reach the hundreds and sit deep in tanh saturation. -->
+                            <input type="range" id="cfg-reppen" min="0.5" max="2" step="0.01" value="1.00" oninput="updateConfig()" onchange="updateConfig()">
+                            <div class="control-hint">1.00 disables it.</div>
+                        </div>
+
+                        <div class="control-item">
+                            <div class="control-header">
+                                <span>Seed</span>
+                                <span class="val" id="val-seed">random</span>
+                            </div>
+                            <div class="seed-row">
+                                <input type="number" id="cfg-seed" min="0" step="1" placeholder="random" oninput="updateConfig()" onchange="updateConfig()">
+                                <button class="btn-icon" title="Clear the seed (draw a fresh one each request)" onclick="clearSeed()">✕</button>
+                            </div>
+                            <div class="control-hint">
+                                Leave empty for a fresh draw each request. A fixed seed makes
+                                sampled output reproducible; 0 is a valid seed, not "off".
+                            </div>
+                        </div>
+
+                        <div class="control-item">
+                            <div class="control-header">
+                                <span>Stop Sequences</span>
+                                <span class="val" id="val-stop">none</span>
+                            </div>
+                            <textarea id="cfg-stop" rows="3" placeholder="One per line" oninput="updateConfig()" onchange="updateConfig()"></textarea>
+                            <div class="control-hint">
+                                One per line, at most <strong id="stop-limit">4</strong>.
+                                Matching text is discarded and never shown. Leading and
+                                trailing spaces are kept exactly as typed.
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Visualizations & Diagnostics -->
                 <div class="panel-section">
                     <div class="section-title">Diagnostics</div>
                     <div class="control-group">
+                        <!-- The per-phase decode breakdown. Every figure here already existed
+                             on PerformanceMetrics and was printed by the CLI footer, but no
+                             endpoint reported it, so the GUI could show a decode rate with no
+                             way to say where the time actually went. -->
+                        <div class="diag-grid">
+                            <div class="diag-row"><span>Prefill</span><span id="diag-prefill">&#8212;</span></div>
+                            <div class="diag-row"><span>Expert I/O</span><span id="diag-expert-io">&#8212;</span></div>
+                            <div class="diag-row"><span>GPU wait</span><span id="diag-gpu-wait">&#8212;</span></div>
+                            <div class="diag-row"><span>LM head</span><span id="diag-lm-head">&#8212;</span></div>
+                            <div class="diag-row"><span>CPU other</span><span id="diag-cpu-other">&#8212;</span></div>
+                            <div class="diag-row"><span>Fence waits</span><span id="diag-gpu-waits">&#8212;</span></div>
+                            <div class="diag-row"><span>I/O calls</span><span id="diag-io-calls">&#8212;</span></div>
+                            <div class="diag-row"><span>Tokens measured</span><span id="diag-tokens">&#8212;</span></div>
+                        </div>
+                        <div class="control-hint">
+                            Per-token averages. LM head overlaps the other phases &mdash; it is
+                            a slice of the same token, not a fifth bucket.
+                        </div>
+
+                        <!-- server.cpp calls this the diagnostic for the open intermittent
+                             crash: "any value above 0 is worth acting on". It was sent by the
+                             telemetry endpoint and displayed nowhere. -->
+                        <div class="diag-warn" id="diag-uma-warn" style="display:none;">
+                            <strong>UMA upload fallbacks: <span id="diag-uma">0</span></strong>
+                            <p>A buffer could not be placed in host-coherent UMA memory and
+                               fell back to an UPLOAD heap. Any value above zero means the
+                               expert pool is over-committing; lower <em>Expert Slots</em>.</p>
+                        </div>
+
+                        <div class="diag-row diag-path"><span>Bundle</span><span id="diag-model-dir">&#8212;</span></div>
+
                         <button class="btn-secondary" onclick="openHeatmapModal()">🔥 Active Expert Heatmap</button>
+                    </div>
+                </div>
+
+                <!-- Fixed at launch. Shown so a user can see the port, bind address, model id
+                     and queue depth the server is actually running with -- all of them change
+                     how requests are answered, and none was visible anywhere before. -->
+                <div class="panel-section" id="panel-server">
+                    <div class="section-title">Server</div>
+                    <div class="control-group">
+                        <div class="diag-grid">
+                            <div class="diag-row"><span>Version</span><span id="srv-version">&#8212;</span></div>
+                            <div class="diag-row"><span>Listening on</span><span id="srv-address">&#8212;</span></div>
+                            <div class="diag-row"><span>OpenAI model id</span><span id="srv-model-id">&#8212;</span></div>
+                            <div class="diag-row"><span>Queue limit</span><span id="srv-queue">&#8212;</span></div>
+                            <div class="diag-row"><span>Context ceiling</span><span id="srv-context-max">&#8212;</span></div>
+                            <div class="diag-row"><span>GPU</span><span id="srv-gpu">&#8212;</span></div>
+                        </div>
+                        <div class="diag-warn" id="srv-lan-warn" style="display:none;">
+                            <strong>Reachable from the network</strong>
+                            <p>This server was started with <code>--host 0.0.0.0</code>. It has
+                               no authentication and can load models, so anyone who can reach
+                               this port can drive it. Restart without that flag to bind
+                               loopback only.</p>
+                        </div>
+                        <div class="control-hint">
+                            These are fixed when the process starts. Change them with
+                            <code>--port</code>, <code>--host</code>, <code>--model-id</code>
+                            and <code>--queue-limit</code>.
+                        </div>
                     </div>
                 </div>
             </aside>
@@ -312,7 +518,7 @@
     <div class="modal-overlay" id="heatmap-modal">
         <div class="modal-card">
             <div style="display:flex; justify-content:space-between; align-items:center;">
-                <h2>Active Expert Routing &mdash; Layer 0 (128 Experts)</h2>
+                <h2 id="heatmap-title">Active Expert Routing &mdash; Layer 0</h2>
                 <button class="btn-secondary" onclick="closeHeatmapModal()">✕ Close</button>
             </div>
             <p style="font-size:13px; color:var(--text-secondary);">Highlights the 8 routed MoE experts the router selected for layer 0 on the most recent token. The engine reports layer 0 only.</p>

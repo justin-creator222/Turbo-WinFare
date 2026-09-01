@@ -1,5 +1,9 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(turbo_winfare LANGUAGES CXX)
+project(turbo_winfare VERSION 0.1.0 LANGUAGES CXX)
+
+# Reported by GET /api/server_info so the GUI can show which build it is talking to.
+# There was no version string anywhere in the project before this.
+add_compile_definitions(GTURBO_VERSION_STRING="${PROJECT_VERSION}")
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -76,6 +80,7 @@ set(TURBO_ENGINE_SOURCES
     src/cpu_reference.cpp
     src/runner.cpp
     src/server.cpp
+    src/model_fetch.cpp
     src/c_api.cpp
 )
 

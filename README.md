@@ -142,6 +142,7 @@ silent fallback to the default.
 | `--slots <n>` | Expert cache slots per layer; 0 auto-sizes from RAM. Alias: `--expert-cache-slots` |
 | `--dump-tensors <dir>` | Per-stage FP32 tensors for the first token (`--cpu` only) |
 | `--port <n>` | HTTP port (default 8080) |
+| `--host <addr>` | Bind address. `127.0.0.1` (default) or `0.0.0.0` to accept connections from other machines |
 | `--serve` | Start the server without opening a browser |
 | `--model-id <name>` | Model name the OpenAI endpoints expect |
 | `--queue-limit <n>` | Requests allowed to wait for the engine (default 4) |
@@ -178,10 +179,43 @@ in flight answers `409` instead of tearing the engine down underneath it, and al
 and OpenAI alike — is serialized through one lock, since the runner has a single KV cache and one
 set of GPU scratch buffers.
 
-`run_gui.py` is a separate Python bridge that loads `libturbo_engine.dll` through `ctypes`. It is a
-convenience only and is **not** at parity: the C ABI exposes no setter for context or slots, so it
-reports those as unsupported rather than storing a value it cannot apply. Prefer the native
-server.
+Every runtime setting the engine supports has a control:
+
+| Panel | What it exposes |
+|---|---|
+| Model Repository | Bundle list, load/unload, and the loaded bundle's real architecture, routed top-K and quantization (read from its manifest, not hardcoded) |
+| Get a Model | Downloads and repacks the pinned checkpoint without leaving the browser — see below |
+| Memory & DRAM Cache | Context, expert slots, eviction policy, cache flush |
+| Generation Parameters | Temperature, top-P, top-K, max tokens |
+| Sampling & Determinism | Repetition penalty, seed, and up to four stop sequences |
+| Diagnostics | The per-token phase breakdown (expert I/O, GPU wait, LM head, CPU), prefill rate, I/O calls, and a warning if `uma_upload_fallbacks` is ever non-zero |
+| Server | The launch-fixed values — version, bind address, port, OpenAI model id, queue limit, context ceiling |
+
+Each response carries a footer with its prompt/completion token counts, time-to-first-token,
+decode rate and stop reason. A rejected setting is reported and the control snaps back to the
+value the engine actually holds; nothing in the sidebar displays a number the engine has not
+confirmed.
+
+The page loads no external resources, so it works with no network at all.
+
+### Getting a model from the GUI
+
+The **Get a Model** panel runs `tools/convert_hf_to_gturbo.py` server-side and streams its
+progress back, so a fresh install needs no command line. It checks Python, the converter script
+and free disk up front and says which one is missing rather than failing later. A HuggingFace
+token is only needed for a gated repository; it is passed to the converter through its
+environment, never on a command line, and is not stored or logged. **Cancel** keeps the
+`.partial` directory so **Resume** continues rather than restarting the ~14.6 GB transfer.
+
+Downloads are refused while a generation is running: decode is I/O-bound and the two contend for
+the same NVMe.
+
+There is one front-end. A second one, a Python `http.server` bridge (`run_gui.py`) that loaded
+`libturbo_engine.dll` through `ctypes`, has been removed: it registered no `/v1/*` routes and no
+`GET /api/config`, both of which the browser GUI requires, so chat under it was not degraded but
+entirely non-functional. `libturbo_engine.dll` and the `extern "C"` ABI in
+[include/gturbo/c_api.h](include/gturbo/c_api.h) remain — they are a supported embedding
+boundary, independent of that bridge.
 
 ### OpenAI-compatible API
 

@@ -16,7 +16,13 @@
     --radius-sm: 8px;
     --radius-md: 14px;
     --radius-lg: 20px;
+    /* System stacks. 'Inter' and 'JetBrains Mono' are kept at the front so the design is
+       unchanged on a machine that has them installed, but nothing is fetched over the
+       network -- see the note in index.html. "Segoe UI" and Cascadia Mono ship with
+       Windows 11, which is this project's only supported platform. */
     --font: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    --font-mono: 'JetBrains Mono', 'Cascadia Mono', Consolas, ui-monospace, SFMono-Regular,
+                 Menlo, monospace;
 }
 
 * {
@@ -118,7 +124,7 @@ header {
 .hud-card .val {
     font-size: 13px;
     font-weight: 700;
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-mono);
     color: #60a5fa;
 }
 
@@ -449,7 +455,7 @@ aside {
     color: #60a5fa;
     padding: 2px 8px;
     border-radius: 10px;
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-mono);
     border: 1px solid rgba(96, 165, 250, 0.3);
 }
 
@@ -557,7 +563,7 @@ aside {
 .meta-row span:last-child {
     color: var(--text-primary);
     font-weight: 600;
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-mono);
 }
 
 /* RAM Dashboard Elements */
@@ -646,7 +652,7 @@ aside {
 .ram-metric .val {
     font-size: 12px;
     font-weight: 700;
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-mono);
     color: #60a5fa;
     margin-top: 2px;
 }
@@ -665,7 +671,7 @@ aside {
 }
 
 .control-header span.val {
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--font-mono);
     color: var(--accent);
 }
 
@@ -768,4 +774,361 @@ select:focus, input:focus {
 .expert-cell.active {
     background: #10b981;
     box-shadow: 0 0 6px #10b981;
+}
+
+/* ------------------------------------------------------------------------
+   Audit remediation: styles for elements the markup already assumed.
+   `.help-tooltip` was referenced by index.html with no rule anywhere in this
+   file, so the help glyph rendered as unstyled body text.
+   ------------------------------------------------------------------------ */
+
+.help-tooltip {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    margin-left: 6px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    font-size: 10px;
+    cursor: help;
+    user-select: none;
+}
+
+.help-tooltip:hover {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+}
+
+/* Shown when GET /api/config could not be read: the sidebar is then displaying
+   pre-hydration placeholders rather than the engine's real configuration. */
+.stale-notice {
+    margin: 0 0 12px;
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    background: rgba(245, 158, 11, 0.10);
+    border: 1px solid rgba(245, 158, 11, 0.35);
+    color: #fbbf24;
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+/* Applied to the two config panels alongside the banner above. */
+.panel-section.stale {
+    opacity: 0.55;
+    filter: grayscale(0.5);
+}
+
+.no-model-help {
+    margin-top: 10px;
+    padding: 12px;
+    border-radius: var(--radius-sm);
+    background: rgba(59, 130, 246, 0.08);
+    border: 1px solid rgba(59, 130, 246, 0.30);
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--text-secondary);
+}
+
+.no-model-help strong {
+    display: block;
+    margin-bottom: 6px;
+    color: var(--text-primary);
+}
+
+.no-model-help code {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    background: rgba(0, 0, 0, 0.35);
+    padding: 1px 4px;
+    border-radius: 3px;
+}
+
+/* Running prompt-token estimate against the engine's resolved context window. */
+.context-usage {
+    margin-bottom: 8px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+}
+
+.context-usage.warn { color: #fbbf24; }
+.context-usage.over { color: #f87171; font-weight: 600; }
+
+/* ------------------------------------------------------------------------
+   Phase 2: sampling controls, the per-phase diagnostics panel, the read-only
+   server panel, and the per-response stats footer.
+   ------------------------------------------------------------------------ */
+
+.control-hint {
+    margin-top: 6px;
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--text-secondary);
+}
+
+.control-hint code {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    background: rgba(0, 0, 0, 0.35);
+    padding: 1px 4px;
+    border-radius: 3px;
+}
+
+.seed-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+}
+
+.seed-row input[type="number"] {
+    flex: 1;
+    min-width: 0;
+}
+
+#cfg-stop {
+    width: 100%;
+    resize: vertical;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.5;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    padding: 8px;
+}
+
+#cfg-stop:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+/* Diagnostics + server metric grids */
+.diag-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-bottom: 8px;
+}
+
+.diag-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 10px;
+    font-size: 11px;
+    padding: 4px 8px;
+    background: var(--card-bg);
+    border-radius: var(--radius-sm);
+}
+
+.diag-row > span:first-child {
+    color: var(--text-secondary);
+}
+
+.diag-row > span:last-child {
+    font-family: var(--font-mono);
+    color: var(--text-primary);
+}
+
+/* Absolute bundle paths are long; wrap instead of overflowing the sidebar. */
+.diag-row.diag-path > span:last-child {
+    text-align: right;
+    word-break: break-all;
+    font-size: 10px;
+}
+
+.diag-warn {
+    margin: 8px 0;
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    background: rgba(248, 113, 113, 0.10);
+    border: 1px solid rgba(248, 113, 113, 0.35);
+    font-size: 11px;
+    line-height: 1.55;
+    color: #fca5a5;
+}
+
+.diag-warn strong {
+    display: block;
+    margin-bottom: 4px;
+    color: #f87171;
+}
+
+.diag-warn p {
+    margin: 0;
+}
+
+.diag-warn code {
+    font-family: var(--font-mono);
+    background: rgba(0, 0, 0, 0.35);
+    padding: 1px 4px;
+    border-radius: 3px;
+}
+
+/* Per-response footer under an assistant bubble. */
+.msg-stats {
+    margin-top: 6px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-secondary);
+    opacity: 0.75;
+}
+
+/* ------------------------------------------------------------------------
+   Phase 3: in-app model acquisition.
+   ------------------------------------------------------------------------ */
+
+.download-intro {
+    font-size: 11px;
+    line-height: 1.6;
+    color: var(--text-secondary);
+    margin-bottom: 10px;
+}
+
+.download-intro code,
+.prereq code {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    background: rgba(0, 0, 0, 0.35);
+    padding: 1px 4px;
+    border-radius: 3px;
+    word-break: break-all;
+}
+
+.prereq-list {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin-bottom: 12px;
+}
+
+.prereq {
+    font-size: 11px;
+    font-family: var(--font-mono);
+    padding: 3px 8px;
+    border-radius: var(--radius-sm);
+    background: var(--card-bg);
+}
+
+.prereq.ok  { color: var(--accent-green); }
+.prereq.bad { color: #f87171; }
+
+#panel-download input[type="text"],
+#panel-download input[type="password"] {
+    width: 100%;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    padding: 8px;
+    font-size: 12px;
+    font-family: var(--font-mono);
+}
+
+#panel-download input[type="text"]:focus,
+#panel-download input[type="password"]:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+#panel-download input:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    cursor: pointer;
+}
+
+.checkbox-row input[type="checkbox"] {
+    accent-color: var(--accent);
+    width: 14px;
+    height: 14px;
+    cursor: pointer;
+}
+
+.dl-progress {
+    margin-top: 12px;
+}
+
+.dl-stage {
+    font-size: 11px;
+    color: var(--text-primary);
+    margin-bottom: 6px;
+}
+
+.dl-bar {
+    height: 6px;
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: 3px;
+    overflow: hidden;
+}
+
+.dl-fill {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--accent), var(--accent-purple));
+    transition: width 0.3s ease;
+}
+
+.dl-meta {
+    margin-top: 6px;
+    font-size: 10px;
+    font-family: var(--font-mono);
+    color: var(--text-secondary);
+}
+
+.dl-result {
+    margin-top: 12px;
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    font-size: 11px;
+    line-height: 1.55;
+}
+
+.dl-result.ok {
+    background: rgba(16, 185, 129, 0.10);
+    border: 1px solid rgba(16, 185, 129, 0.35);
+    color: #6ee7b7;
+}
+
+.dl-result.error {
+    background: rgba(248, 113, 113, 0.10);
+    border: 1px solid rgba(248, 113, 113, 0.35);
+    color: #fca5a5;
+    word-break: break-word;
+}
+
+#dl-start:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+/* Two classes the markup has always used with no rule behind them. `.msg-content` is the
+   column that holds a bubble and, since the audit, its stats footer -- it needs to be a
+   flex column so the footer sits under the bubble rather than beside it. */
+.msg-content {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.msg.user .msg-content {
+    align-items: flex-end;
+}
+
+.sp-icon {
+    margin-right: 6px;
+    opacity: 0.85;
 }

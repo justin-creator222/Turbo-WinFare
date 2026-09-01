@@ -10,6 +10,7 @@
 
 #include "gturbo/http.hpp"
 #include "gturbo/json.hpp"
+#include "gturbo/model_fetch.hpp"
 
 #include <cassert>
 #include <chrono>
@@ -267,6 +268,110 @@ int main() {
         assert(rejects("{'a':1}"));
         assert(rejects(std::string(200, '[')));   // nesting past the depth limit
         std::cout << "  [PASS] Nested messages parse; malformed input is rejected.\n";
+    }
+
+    // ---- Path traversal: the request target must never escape the document root -------
+    //
+    // This was a live arbitrary file read. The static handler built fs::path("gui" + path)
+    // straight from the request line, so `GET /../../../../../Windows/win.ini` returned that
+    // file with a 200 -- on a server that bound every interface with no authentication.
+    {
+        // Every one of these must be refused.
+        const char* unsafe[] = {
+            "/../CLAUDE.md",
+            "/../../../../../Windows/win.ini",
+            "/gui/../../CLAUDE.md",
+            "/a/b/../../../etc/passwd",
+            "/..",
+            "/../",
+            // Percent-encoded: a check that looked for a literal ".." would pass these.
+            "/%2e%2e/CLAUDE.md",
+            "/..%2fCLAUDE.md",
+            "/%2E%2E%2FCLAUDE.md",
+            // Backslash is a separator on Windows, so it traverses just as well.
+            "/..\\CLAUDE.md",
+            "/%5c..%5cCLAUDE.md",
+            // A drive-qualified path leaves the document root entirely.
+            "/C:/Windows/win.ini",
+            // Not rooted at all.
+            "relative/path",
+            "",
+        };
+        for (const char* p : unsafe) {
+            if (request_path_is_safe(p)) {
+                std::cerr << "  [FAIL] traversal accepted: " << p << "\n";
+                return 1;
+            }
+        }
+
+        // ...and every one of these is a legitimate target that must still work.
+        const char* safe[] = {
+            "/",
+            "/index.html",
+            "/app.js",
+            "/styles.css",
+            "/logo.svg",
+            "/health",
+            "/v1/chat/completions",
+            "/api/telemetry",
+            "/api/download/status",
+            // A filename that merely contains dots is not a traversal.
+            "/some.file..name.js",
+            "/a..b/c.js",
+        };
+        for (const char* p : safe) {
+            if (!request_path_is_safe(p)) {
+                std::cerr << "  [FAIL] legitimate path rejected: " << p << "\n";
+                return 1;
+            }
+        }
+
+        assert(percent_decode("/%2e%2e/x") == "/../x");
+        assert(percent_decode("/plain") == "/plain");
+        // A malformed escape stays literal rather than silently vanishing.
+        assert(percent_decode("/%zz") == "/%zz");
+        assert(percent_decode("/%2") == "/%2");
+        std::cout << "  [PASS] Traversal targets are rejected; real assets still resolve.\n";
+    }
+
+    // ---- Download output names: this string becomes a directory the server creates ------
+    {
+        std::string why;
+        const char* bad[] = {
+            "../evil.gturbo",
+            "..\\evil.gturbo",
+            "C:\\evil.gturbo",
+            "sub/dir.gturbo",
+            "\\\\server\\share.gturbo",
+            "a..b.gturbo",       // no ".." anywhere, even mid-name
+            "notabundle.txt",    // must end in .gturbo
+            ".gturbo",           // suffix alone is not a name
+            "a b.gturbo",        // no spaces: this reaches CreateProcess
+            "a;whoami.gturbo",
+            "a\"quote.gturbo",
+            "",
+        };
+        for (const char* n : bad) {
+            if (gturbo::ModelFetcher::valid_output_name(n, why)) {
+                std::cerr << "  [FAIL] unsafe bundle name accepted: " << n << "\n";
+                return 1;
+            }
+            assert(!why.empty());   // a rejection must say why
+        }
+
+        const char* good[] = {
+            "gemma-4-26b-a4b.gturbo",
+            "my_model-2.gturbo",
+            "A.gturbo",
+        };
+        for (const char* n : good) {
+            if (!gturbo::ModelFetcher::valid_output_name(n, why)) {
+                std::cerr << "  [FAIL] legitimate bundle name rejected: " << n
+                          << " (" << why << ")\n";
+                return 1;
+            }
+        }
+        std::cout << "  [PASS] Download bundle names are restricted to bare .gturbo names.\n";
     }
 
     std::cout << "[TEST] All HTTP / JSON server tests passed.\n";

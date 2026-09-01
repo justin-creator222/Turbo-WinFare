@@ -4,6 +4,7 @@
 #include "gturbo/manifest.hpp"
 #include "gturbo/packed_experts.hpp"
 #include "gturbo/json.hpp"
+#include "gturbo/sampling.hpp"
 #include "gturbo/http.hpp"
 #include <iostream>
 #include <fstream>
@@ -41,6 +42,27 @@ void HTTPServer::set_context(std::shared_ptr<D3D12Context> ctx) {
 void HTTPServer::set_load_error(const std::string& message) {
     std::lock_guard<std::mutex> guard(runner_mutex_);
     load_error_ = message;
+}
+
+const HostEnvironment& HTTPServer::host_environment() const {
+    std::lock_guard<std::mutex> guard(env_mutex_);
+    if (!env_probed_) {
+        host_env_ = probe_host_environment();
+        env_probed_ = true;
+    }
+    return host_env_;
+}
+
+std::string HTTPServer::load_error() const {
+    std::lock_guard<std::mutex> guard(runner_mutex_);
+    return load_error_;
+}
+
+void HTTPServer::set_startup_info(uint16_t port, const std::string& host, bool serve_mode) {
+    std::lock_guard<std::mutex> guard(runner_mutex_);
+    startup_port_ = port;
+    bind_address_ = host;
+    serve_mode_ = serve_mode;
 }
 
 void HTTPServer::set_openai_config(const OpenAIServerConfig& cfg) {
@@ -225,7 +247,20 @@ void HTTPServer::listen_loop(uint16_t port) {
 
     sockaddr_in address{};
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
+    // Loopback by default. This used to be an unconditional INADDR_ANY, which combined with
+    // no authentication and a permissive CORS header to expose model loading -- and the
+    // static file handler -- to anything that could reach the port.
+    if (bind_address_ == "0.0.0.0") {
+        address.sin_addr.s_addr = INADDR_ANY;
+    } else {
+        address.sin_addr.s_addr = inet_addr(bind_address_.c_str());
+        if (address.sin_addr.s_addr == INADDR_NONE) {
+            std::cerr << "[SERVER] Invalid bind address '" << bind_address_ << "'\n";
+            closesocket(server_fd);
+            WSACleanup();
+            return;
+        }
+    }
     address.sin_port = htons(port);
 
     if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) == SOCKET_ERROR) {
@@ -253,6 +288,40 @@ void HTTPServer::listen_loop(uint16_t port) {
 
     closesocket(server_fd);
     WSACleanup();
+}
+
+// Rejects a sampling combination at accept time, using the engine's own rule set, so the
+// GUI learns about it now rather than on the next generation. validate_sampling throws, and
+// its message is the one worth showing.
+static bool sampling_is_valid(const ServerConfig& cfg, std::string& why) {
+    SamplingParams p;
+    p.temperature = cfg.temperature;
+    p.top_p = cfg.top_p;
+    p.top_k = cfg.top_k;
+    p.repetition_penalty = cfg.repetition_penalty;
+    p.has_seed = cfg.has_seed;
+    p.seed = cfg.seed;
+    try {
+        validate_sampling(p);
+    } catch (const std::exception& ex) {
+        why = ex.what();
+        return false;
+    }
+    if (cfg.max_tokens <= 0) {
+        why = "max_tokens must be greater than 0.";
+        return false;
+    }
+    return true;
+}
+
+static std::string json_string_array(const std::vector<std::string>& items) {
+    std::string out = "[";
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (i) out += ",";
+        out += JsonValue::quote(items[i]);
+    }
+    out += "]";
+    return out;
 }
 
 static void send_json_response(SOCKET client, const std::string& json_body, int status_code = 200) {
@@ -320,6 +389,20 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
 
     const std::string& method = req.method;
     const std::string& path = req.path;
+
+    // Reject traversal before anything can act on the path.
+    //
+    // The static handler builds a filesystem path as fs::path("gui" + path), and nothing
+    // upstream inspected the request target, so `GET /../../../../../Windows/win.ini`
+    // returned that file with a 200. Percent-encoding is decoded here first, because
+    // `%2e%2e%2f` reaches the same place without a literal "..".
+    if (!request_path_is_safe(path)) {
+        send_json_response(client_socket_ptr,
+                           "{\"status\":\"ERROR\",\"message\":\"Invalid request path.\"}",
+                           400);
+        closesocket(client);
+        return;
+    }
 
     // OpenAI-compatible surface first: it owns /health and everything under /v1.
     if (path == "/health" || path.rfind("/v1/", 0) == 0) {
@@ -398,12 +481,36 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
                 // Architecture is only known for a loaded bundle; reporting it for an
                 // unopened directory would be a guess.
                 if (is_active) {
-                    const auto& arch = runner->manifest().arch;
+                    const auto& manifest = runner->manifest();
+                    const auto& arch = manifest.arch;
                     json << "\"layers\":" << arch.num_layers << ","
                          << "\"experts\":" << arch.num_experts << ","
-                         << "\"top_k\":" << arch.top_k_experts << ",";
+                         << "\"top_k\":" << arch.top_k_experts << ","
+                         << "\"context_window\":" << runner->max_context() << ","
+                         // The GUI sized its expert-pool estimate from a stride hardcoded in
+                         // JavaScript. Report the real one so the label cannot drift from the
+                         // bundle the engine actually opened.
+                         << "\"expert_stride\":" << runner->layout().expert_stride << ",";
+                    if (!manifest.model_id.empty()) {
+                        json << "\"model_id\":" << JsonValue::quote(manifest.model_id) << ",";
+                    } else {
+                        json << "\"model_id\":null,";
+                    }
+                    // Quantization is optional in the manifest; a bundle without it gets
+                    // null and the GUI drops the row rather than showing a stale literal.
+                    if (manifest.quant) {
+                        const auto& q = manifest.quant->routed_expert;
+                        std::ostringstream desc;
+                        desc << q.scheme << " " << q.weight_bits << "-bit, group "
+                             << q.group_size << ", " << q.scale_type << " scale/bias";
+                        json << "\"quantization\":" << JsonValue::quote(desc.str()) << ",";
+                    } else {
+                        json << "\"quantization\":null,";
+                    }
                 } else {
-                    json << "\"layers\":null,\"experts\":null,\"top_k\":null,";
+                    json << "\"layers\":null,\"experts\":null,\"top_k\":null,"
+                         << "\"context_window\":null,\"expert_stride\":null,"
+                         << "\"model_id\":null,\"quantization\":null,";
                 }
                 json << "\"is_active\":" << (is_active ? "true" : "false")
                      << "}";
@@ -436,6 +543,12 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
                  << "\"top_p\":" << cfg.top_p << ","
                  << "\"top_k\":" << cfg.top_k << ","
                  << "\"max_tokens\":" << cfg.max_tokens << ","
+                 << "\"repetition_penalty\":" << cfg.repetition_penalty << ","
+                 // A null seed means "draw a fresh one per request"; 0 is a legitimate seed
+                 // value, so the two must not share a representation.
+                 << "\"seed\":" << (cfg.has_seed ? std::to_string(cfg.seed) : "null") << ","
+                 << "\"stop\":" << json_string_array(cfg.stop_strings) << ","
+                 << "\"max_stop\":" << kMaxStopSequences << ","
                  << "\"eviction_policy\":\""
                  << ((runner && runner->eviction_policy() == EvictionPolicy::LRU) ? "LRU" : "LFU")
                  << "\","
@@ -458,6 +571,75 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
                  << "}}";
             send_json_response(client, json.str());
 
+        } else if (path == "/api/server_info") {
+            // Read-only home for everything fixed at process launch. These are real settings
+            // that change how the server behaves -- the model id the OpenAI route demands,
+            // the queue depth before a 429, the interface it listens on -- and none of them
+            // was visible anywhere in the GUI, so a user could not tell why a request was
+            // being refused.
+            OpenAIServerConfig ocfg = openai_config();
+            std::string host;
+            uint16_t port = 0;
+            bool serve_mode = false;
+            {
+                std::lock_guard<std::mutex> guard(runner_mutex_);
+                host = bind_address_;
+                port = startup_port_;
+                serve_mode = serve_mode_;
+            }
+            auto info_ctx = current_ctx();
+            const HostEnvironment& env = host_environment();
+
+            std::ostringstream json;
+            json << "{\"status\":\"OK\",\"server\":{"
+                 << "\"version\":" << JsonValue::quote(GTURBO_VERSION_STRING) << ","
+                 << "\"host\":" << JsonValue::quote(host) << ","
+                 << "\"port\":" << port << ","
+                 << "\"lan_accessible\":" << ((host == "0.0.0.0") ? "true" : "false") << ","
+                 << "\"serve_mode\":" << (serve_mode ? "true" : "false") << ","
+                 << "\"model_id\":" << JsonValue::quote(ocfg.model_id) << ","
+                 << "\"queue_limit\":" << ocfg.queue_limit << ","
+                 << "\"context_max\":" << ForwardRunner::kAttentionMaxSpan << ","
+                 << "\"max_stop_sequences\":" << kMaxStopSequences << ","
+                 << "\"gpu_name\":"
+                 << JsonValue::quote(info_ctx ? info_ctx->adapter_name() : "No D3D12 device")
+                 << ","
+                 // What the model-download flow needs in order to run. The GUI disables the
+                 // button with the specific unmet reason rather than letting the user press
+                 // it and discover the problem several seconds later.
+                 << "\"python_available\":" << (env.python_available ? "true" : "false") << ","
+                 << "\"python_version\":"
+                 << (env.python_version.empty() ? "null" : JsonValue::quote(env.python_version))
+                 << ","
+                 << "\"converter_present\":" << (env.converter_present ? "true" : "false") << ","
+                 << "\"free_disk_gb\":" << env.free_disk_gb << ","
+                 // Peak transient cost of a conversion, from the README: ~14 GB for the
+                 // bundle plus ~15 GB of streamed input.
+                 << "\"download_needs_gb\":29"
+                 << "}}";
+            send_json_response(client, json.str());
+
+        } else if (path == "/api/download/status") {
+            const FetchProgress fp = fetcher_.snapshot();
+            std::ostringstream json;
+            json << "{\"status\":\"OK\",\"download\":{"
+                 << "\"state\":" << JsonValue::quote(fetch_state_name(fp.state)) << ","
+                 << "\"output\":" << JsonValue::quote(fp.output) << ","
+                 << "\"stage\":" << JsonValue::quote(fp.stage) << ","
+                 << "\"step\":" << fp.step << ","
+                 << "\"steps\":" << fp.steps << ","
+                 << "\"label\":" << JsonValue::quote(fp.label) << ","
+                 << "\"bytes_done\":" << fp.bytes_done << ","
+                 << "\"bytes_total\":" << fp.bytes_total << ","
+                 << "\"pct\":" << fp.pct << ","
+                 << "\"rate_mbs\":" << fp.rate_mbs << ","
+                 << "\"eta_s\":" << fp.eta_s << ","
+                 << "\"exit_code\":" << fp.exit_code << ","
+                 << "\"message\":" << JsonValue::quote(fp.message) << ","
+                 << "\"log\":" << json_string_array(fetcher_.recent_output())
+                 << "}}";
+            send_json_response(client, json.str());
+
         } else if (path == "/api/telemetry") {
             D3D12Context::SystemMemoryInfo sys_mem{};
             auto runner = current_runner();
@@ -471,6 +653,8 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
             std::string model_dir = "None (No Model Loaded)";
             bool active = false;
             std::vector<int> active_experts;
+            // Copied under runner_mutex_ rather than read bare off the member.
+            const std::string load_err = load_error();
 
             if (runner) {
                 mod_mem = runner->get_memory_usage();
@@ -491,7 +675,7 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
                  << "\"model_active\":" << (active ? "true" : "false") << ","
                  << "\"model_dir\":" << JsonValue::quote(model_dir) << ","
                  << "\"load_error\":"
-                 << (load_error_.empty() ? "null" : JsonValue::quote(load_error_)) << ","
+                 << (load_err.empty() ? "null" : JsonValue::quote(load_err)) << ","
                  << "\"memory\":{"
                      << "\"resident_weights_mb\":" << (mod_mem.resident_weights_bytes / (1024.0 * 1024.0)) << ","
                      << "\"kv_cache_mb\":" << (mod_mem.kv_cache_bytes / (1024.0 * 1024.0)) << ","
@@ -516,7 +700,18 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
                      << "\"decode_toks_sec\":" << perf.decode_tokens_per_sec << ","
                      << "\"total_time_ms\":" << perf.total_time_ms << ","
                      << "\"total_io_mbs\":" << ((perf.total_time_ms > 0) ? (perf.total_io_bytes / (1024.0 * 1024.0) / (perf.total_time_ms / 1000.0)) : 0.0) << ","
-                     << "\"total_io_calls\":" << perf.total_io_calls
+                     << "\"total_io_calls\":" << perf.total_io_calls << ","
+                     // The per-phase breakdown. These six already existed on
+                     // PerformanceMetrics and were printed by the CLI footer, but no
+                     // endpoint reported them -- so the GUI could show a decode rate with no
+                     // way to say where the time went. lm_head_ms deliberately overlaps the
+                     // other buckets; it is a slice of the same token, not a fifth phase.
+                     << "\"expert_io_ms\":" << perf.expert_io_ms << ","
+                     << "\"gpu_wait_ms\":" << perf.gpu_wait_ms << ","
+                     << "\"lm_head_ms\":" << perf.lm_head_ms << ","
+                     << "\"cpu_other_ms\":" << perf.cpu_other_ms << ","
+                     << "\"gpu_waits\":" << perf.gpu_waits << ","
+                     << "\"tokens_measured\":" << perf.tokens_measured
                  << "},"
                  << "\"cache\":{"
                      << "\"hit_rate_pct\":" << mod_mem.cache_hit_rate_pct << ","
@@ -652,14 +847,33 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
                 opts.temperature = static_cast<float>(req_json.double_or("temperature", config_.temperature));
                 opts.top_p       = static_cast<float>(req_json.double_or("top_p", config_.top_p));
                 opts.top_k       = static_cast<int>(req_json.int_or("top_k", config_.top_k));
-                opts.repetition_penalty =
-                    static_cast<float>(req_json.double_or("repetition_penalty", 1.0));
+                opts.repetition_penalty = static_cast<float>(
+                    req_json.double_or("repetition_penalty", config_.repetition_penalty));
                 if (req_json.has("seed")) {
                     opts.has_seed = true;
                     opts.seed = static_cast<uint64_t>(req_json.int_or("seed", 0));
+                } else {
+                    opts.has_seed = config_.has_seed;
+                    opts.seed = config_.seed;
                 }
                 // The GUI has always sent this; the server used to drop it on the floor.
                 opts.system_prompt = req_json.string_or("system_prompt", "");
+
+                // Stop sequences. This route did not parse `stop` at all, so a feature the
+                // engine, the C ABI and /v1 all support was unreachable here -- and a caller
+                // that sent one got a silent no-op rather than an error.
+                if (req_json.has("stop")) {
+                    std::vector<std::string> stops;
+                    const std::string stop_err =
+                        parse_stop_field(req_json, kMaxStopSequences, stops);
+                    if (!stop_err.empty()) {
+                        message_error = stop_err;
+                    } else {
+                        opts.stop_strings = std::move(stops);
+                    }
+                } else {
+                    opts.stop_strings = config_.stop_strings;
+                }
             }
 
             if (!message_error.empty()) {
@@ -732,16 +946,52 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
                 auto cfg_runner = current_runner();
                 {
                     std::lock_guard<std::mutex> cfg(config_mutex_);
-                    config_.temperature = static_cast<float>(req_json.double_or("temperature", config_.temperature));
-                    config_.top_p       = static_cast<float>(req_json.double_or("top_p", config_.top_p));
-                    config_.top_k       = static_cast<int>(req_json.int_or("top_k", config_.top_k));
-                    config_.max_tokens  = static_cast<int>(req_json.int_or("max_tokens", config_.max_tokens));
+
+                    // Work on a copy and commit only once every field has passed. Applying
+                    // straight to config_ meant a rejected request still stored its bad
+                    // value: POSTing top_k 999 answered 400 and left 999 in place, so the
+                    // *next* request -- which does not resend top_k, because the GUI only
+                    // sends what it holds -- was rejected too, for a value the user never
+                    // successfully set. A 400 must leave the configuration untouched.
+                    ServerConfig next = config_;
+
+                    next.temperature = static_cast<float>(req_json.double_or("temperature", next.temperature));
+                    next.top_p       = static_cast<float>(req_json.double_or("top_p", next.top_p));
+                    next.top_k       = static_cast<int>(req_json.int_or("top_k", next.top_k));
+                    next.max_tokens  = static_cast<int>(req_json.int_or("max_tokens", next.max_tokens));
+                    next.repetition_penalty = static_cast<float>(
+                        req_json.double_or("repetition_penalty", next.repetition_penalty));
+
+                    // An explicit null clears the seed back to "fresh each request"; 0 is a
+                    // real seed and must not mean the same thing.
+                    if (req_json.has("seed")) {
+                        const JsonValue& sv = req_json.object_value.at("seed");
+                        if (sv.is_null()) {
+                            next.has_seed = false;
+                            next.seed = 0;
+                        } else {
+                            next.has_seed = true;
+                            next.seed = static_cast<uint64_t>(req_json.int_or("seed", 0));
+                        }
+                    }
+
+                    if (req_json.has("stop")) {
+                        std::vector<std::string> stops;
+                        const std::string stop_err =
+                            parse_stop_field(req_json, kMaxStopSequences, stops);
+                        if (!stop_err.empty()) {
+                            reject = stop_err;
+                        } else {
+                            next.stop_strings = std::move(stops);
+                        }
+                    }
 
                     if (req_json.has("eviction_policy")) {
-                        std::string p = req_json.string_or("eviction_policy", "lfu");
-                        std::transform(p.begin(), p.end(), p.begin(),
+                        std::string pol = req_json.string_or("eviction_policy", "lfu");
+                        std::transform(pol.begin(), pol.end(), pol.begin(),
                                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                        config_.eviction_policy = (p == "lru") ? EvictionPolicy::LRU : EvictionPolicy::LFU;
+                        next.eviction_policy = (pol == "lru") ? EvictionPolicy::LRU
+                                                              : EvictionPolicy::LFU;
                     }
 
                     // Slot count and context size take effect on the next model load, not
@@ -753,18 +1003,22 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
                     // controls from the resolved numbers, so comparing against the raw 0 made
                     // the very first slider touch claim a reload was needed when nothing had
                     // actually changed.
-                    int cur_ctx = config_.context_len ? config_.context_len
-                                : (cfg_runner ? cfg_runner->max_context() : 0);
-                    int cur_slots = config_.slots ? config_.slots
-                                  : (cfg_runner ? static_cast<int>(cfg_runner->expert_slots_per_layer()) : 0);
-                    int new_ctx   = static_cast<int>(req_json.int_or("context_len", cur_ctx));
-                    int new_slots = static_cast<int>(req_json.int_or("slots", cur_slots));
+                    const int cur_ctx = config_.context_len ? config_.context_len
+                                      : (cfg_runner ? cfg_runner->max_context() : 0);
+                    const int cur_slots = config_.slots ? config_.slots
+                                        : (cfg_runner ? static_cast<int>(cfg_runner->expert_slots_per_layer()) : 0);
+                    const int new_ctx   = static_cast<int>(req_json.int_or("context_len", cur_ctx));
+                    const int new_slots = static_cast<int>(req_json.int_or("slots", cur_slots));
 
                     // Validate at accept time. These used to be stored verbatim and echoed
                     // back as SUCCESS, so `slots: 999` looked applied and only exploded on
                     // the next load -- which, now that a reload actually honours them, would
                     // turn a typo into a dead engine.
-                    if (new_ctx != 0 && (new_ctx < 1 || new_ctx > ForwardRunner::kAttentionMaxSpan)) {
+                    if (!reject.empty()) {
+                        // A stop-field rejection above already has a message.
+                    } else if (!sampling_is_valid(next, reject)) {
+                        // Message filled by sampling_is_valid.
+                    } else if (new_ctx != 0 && (new_ctx < 1 || new_ctx > ForwardRunner::kAttentionMaxSpan)) {
                         reject = "context_len must be between 1 and " +
                                  std::to_string(ForwardRunner::kAttentionMaxSpan) +
                                  " (0 auto-sizes from RAM).";
@@ -786,8 +1040,9 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
 
                     if (reject.empty()) {
                         requires_reload = (new_ctx != cur_ctx) || (new_slots != cur_slots);
-                        config_.context_len = new_ctx;
-                        config_.slots = new_slots;
+                        next.context_len = new_ctx;
+                        next.slots = new_slots;
+                        config_ = next;          // the single commit point
                     }
                     applied = config_;
                 }
@@ -808,6 +1063,10 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
                      << "\"requires_reload\":" << (requires_reload ? "true" : "false") << ","
                      << "\"config\":{"
                      << "\"temperature\":" << applied.temperature << ","
+                     << "\"repetition_penalty\":" << applied.repetition_penalty << ","
+                     << "\"seed\":"
+                     << (applied.has_seed ? std::to_string(applied.seed) : "null") << ","
+                     << "\"stop\":" << json_string_array(applied.stop_strings) << ","
                      << "\"top_p\":" << applied.top_p << ","
                      << "\"top_k\":" << applied.top_k << ","
                      << "\"max_tokens\":" << applied.max_tokens << ","
@@ -867,6 +1126,59 @@ void HTTPServer::handle_client(uintptr_t client_socket_ptr) {
                  << ", \"message\":\"Generation stop signal sent.\"}";
             send_json_response(client, json.str());
 
+        } else if (path == "/api/download") {
+            // Starts a bundle build: tools/convert_hf_to_gturbo.py streams the pinned
+            // checkpoint and repacks it. See include/gturbo/model_fetch.hpp for why this
+            // drives the existing script rather than reimplementing it here.
+            if (!body_ok) {
+                send_json_response(client,
+                    "{\"status\":\"ERROR\",\"message\":\"Request body must be a JSON object.\"}",
+                    400);
+                closesocket(client);
+                return;
+            }
+
+            // Refuse while the engine is generating. Decode is I/O-bound and a conversion
+            // saturates the same NVMe -- CLAUDE.md records a contended run at 5.07 tok/s
+            // against 6.03 idle, and it also evicts the expert pages the streamer relies on
+            // the OS page cache to hold.
+            {
+                std::unique_lock<std::mutex> busy(generate_mutex_, std::try_to_lock);
+                if (!busy.owns_lock()) {
+                    send_json_response(client,
+                        "{\"status\":\"ERROR\",\"message\":\"A generation is in progress. "
+                        "Downloading now would contend for the same disk and slow both.\"}",
+                        409);
+                    closesocket(client);
+                    return;
+                }
+            }
+
+            const std::string output = req_json.string_or("output", "");
+            const std::string token = req_json.string_or("token", "");
+            const bool resume = req_json.bool_or("resume", false);
+
+            std::string start_error;
+            if (!fetcher_.start(output, token, resume, start_error)) {
+                // 409 when something is already running, 400 when the request itself is bad.
+                const int code = fetcher_.is_running() ? 409 : 400;
+                send_json_response(client,
+                    "{\"status\":\"ERROR\",\"message\":" + JsonValue::quote(start_error) + "}",
+                    code);
+            } else {
+                send_json_response(client,
+                    "{\"status\":\"SUCCESS\",\"message\":\"Download started.\",\"output\":" +
+                    JsonValue::quote(output) + "}", 202);
+            }
+
+        } else if (path == "/api/download/cancel") {
+            const bool was_running = fetcher_.is_running();
+            fetcher_.cancel();
+            send_json_response(client,
+                std::string("{\"status\":\"SUCCESS\",\"was_running\":") +
+                (was_running ? "true" : "false") +
+                ",\"message\":\"Cancelled. The partial download was kept for Resume.\"}");
+
         } else if (path == "/api/clear_cache") {
             // Clearing mid-generation is benign today (pinned slots survive), but taking
             // the lock costs two lines and removes the need for anyone to re-derive that.
@@ -918,7 +1230,7 @@ bool HTTPServer::handle_openai(uintptr_t client, const HttpRequest& req) {
             return true;
         }
         send_http_response(client, 200, "application/json",
-                           render_models_list(openai_cfg_.model_id), false);
+                           render_models_list(openai_config().model_id), false);
         return true;
     }
 
@@ -1052,7 +1364,7 @@ void HTTPServer::handle_chat_completion(uintptr_t client, const HttpRequest& req
     }
 
     if (!alive) return;
-    if (!send_event(render_final_chunk(id, vr.model, created, result.reason))) return;
+    if (!send_event(render_final_chunk(id, vr.model, created, result))) return;
     if (vr.include_usage) {
         if (!send_event(render_usage_chunk(id, vr.model, created, result))) return;
     }

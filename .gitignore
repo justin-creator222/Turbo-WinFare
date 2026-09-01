@@ -2,6 +2,9 @@
 # THIRD_PARTY_NOTICES.md: weights are downloaded at run time from the pinned
 # Hugging Face checkpoint and remain governed by their source terms.
 *.gturbo/
+# Interrupted conversions. The GUI download and `--resume` both leave one of these
+# behind on purpose; it holds multi-GB of partially written weights.
+*.gturbo.partial/
 *.gturbo.placeholder-OLD/
 *.bin
 *.safetensors

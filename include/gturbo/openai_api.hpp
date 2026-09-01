@@ -45,6 +45,18 @@ struct OpenAIServerConfig {
     int queue_limit{4};
 };
 
+// Parses an OpenAI-shaped `stop` field -- a string, an array of strings, or null -- into
+// `out`. Returns an empty string on success, or the reason it was rejected.
+//
+// Shared by /v1/chat/completions and /api/generate. /api/generate previously did not parse
+// `stop` at all, so stop sequences were reachable only through the OpenAI route even though
+// the engine, the C ABI and the GUI all support them.
+std::string parse_stop_field(const JsonValue& body, size_t max_stops,
+                             std::vector<std::string>& out);
+
+// The most stop sequences either route accepts.
+constexpr size_t kMaxStopSequences = 4;
+
 // Returns false and fills `err` on any rejection. `manifest_vocab` is unused today but keeps
 // the signature stable for token-budget checks.
 bool validate_chat_request(const JsonValue& body, const OpenAIServerConfig& cfg,
@@ -56,8 +68,15 @@ std::string render_completion(const std::string& id, const std::string& model,
 // One SSE data payload. `role_only` emits the opening delta that carries the assistant role.
 std::string render_chunk(const std::string& id, const std::string& model, int64_t created,
                          const std::string& delta, bool role_only);
+// The final SSE chunk. `result` supplies a vendor "x_turbo" object carrying the engine's
+// real stop reason, the stop string that matched, and time-to-first-token.
+//
+// finish_reason itself stays strictly OpenAI-shaped -- it collapses Cancelled and StopString
+// into "stop" -- because clients switch on it. An unknown top-level member is ignored by
+// every OpenAI client, so adding one alongside is non-breaking, and it is the only way the
+// GUI can tell "hit your stop sequence" apart from "the user pressed stop".
 std::string render_final_chunk(const std::string& id, const std::string& model, int64_t created,
-                               StopReason reason);
+                               const GenerationResult& result);
 std::string render_usage_chunk(const std::string& id, const std::string& model, int64_t created,
                                const GenerationResult& result);
 std::string render_models_list(const std::string& model_id);

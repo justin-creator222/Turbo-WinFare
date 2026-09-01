@@ -103,8 +103,13 @@ Two front-ends both talk to the same engine core:
   | `--context <n>` / `--slots <n>` | 0 = auto-size from installed RAM |
   | `--dump-tensors <dir>` | per-stage FP32 tensors for token 0 (`--cpu` only) |
   | `--port <n>` | GUI port |
+  | `--host <addr>` | Bind address; `127.0.0.1` (default) or `0.0.0.0` |
 
-- **Python bridge**: `python run_gui.py` -- an `http.server` that loads `libturbo_engine.dll` via `ctypes` and calls the C API. Kept as a convenience only; it is **not** at parity with the native server and does not push its config to the engine.
+`run_gui.py` (a Python `http.server` bridge over the C ABI) **has been removed.** It registered
+no `/v1/*` routes and no `GET /api/config`, and `gui/app.js` requires both -- so generation under
+it was not merely degraded, it never ran at all, and it silently served the sidebar's
+pre-hydration placeholder values. `libturbo_engine.dll` and the `extern "C"` ABI stay; only the
+bridge is gone.
 
 The GUI static assets live in [gui/](gui/) (`index.html`, `app.js`, `styles.css`).
 
@@ -120,6 +125,48 @@ The sidebar seeds itself from `GET /api/config`, which reports the engine's *res
 context and slot count (a stored 0 means "auto-size from RAM"). Values hardcoded in
 `index.html` are placeholders only -- before hydration existed the panel advertised a 62000
 token context while the engine was auto-sized to 4096.
+
+**The GUI exposes every runtime engine setting**, and nothing it shows is a literal. Panels:
+Model Repository, Get a Model, Memory & DRAM Cache, Generation Parameters, Sampling &
+Determinism (repetition penalty / seed / stop sequences), Diagnostics (the per-token phase
+breakdown plus `uma_upload_fallbacks`), and a read-only Server panel for the launch-fixed
+values. Three classes of bug were removed here and each is worth not reintroducing:
+
+- **The stop button was unreachable.** `sendPrompt()` returned on an empty textarea *before*
+  checking `isGenerating`, and sending clears the textarea -- so during a generation the box
+  was always empty and the button did nothing. The `isGenerating` branch must stay first.
+- **The model id was hardcoded** as `gemma-4-26b-a4b-it` in the `/v1` payload, so `--model-id`
+  made every message 404 while the HUD still read READY. It now comes from `GET /v1/models`.
+- **`meta-arch` / `meta-topk` / `meta-quant` were literals no code ever wrote.** `/api/models`
+  now reports `layers`, `experts`, `top_k`, `expert_stride`, `model_id` and `quantization` for
+  the active bundle, and the GUI renders those. The slot-size estimate uses the reported
+  stride rather than a constant in JavaScript.
+
+`POST /api/config` validates into a copy and commits once. It used to write each field into
+`config_` as it parsed, then reject -- so a refused `top_k: 999` was *stored*, and the next
+request (which does not resend top_k) was refused for a value the user never set.
+
+The GUI loads no external resources. It used to pull Inter and JetBrains Mono from
+`fonts.googleapis.com`, which blocks first paint on a DNS timeout -- on an offline machine,
+which is the whole point of a local inference engine.
+
+### Model acquisition (`/api/download`)
+
+`ModelFetcher` ([src/model_fetch.cpp](src/model_fetch.cpp)) runs
+`tools/convert_hf_to_gturbo.py --progress-json` as a child process and parses one JSON object
+per line. Building a bundle is a ~14.6 GB stream-and-repack with a 16 KB-aligned layout and a
+manifest of sha256s; that logic exists, is tested, and is the only thing that has ever
+produced a loadable bundle. A C++ reimplementation would be a second copy that must stay
+bit-identical forever, plus a TLS stack the engine does not otherwise link.
+
+Three things there are load-bearing:
+
+- **`HF_TOKEN` goes in the child's environment, never on the command line.** A command line is
+  readable by every process on the machine.
+- **`PYTHONUNBUFFERED=1`**, or Python block-buffers the pipe and the GUI sits at 0% for
+  minutes before the first 8 KB flushes.
+- **The output name is an allowlist** (`[A-Za-z0-9._-]+\.gturbo`, no `..`): it arrives over
+  HTTP and becomes a directory the server creates.
 
 ### OpenAI-compatible API
 
@@ -192,7 +239,8 @@ Engine core (all in `gturbo::` namespace, headers under [include/gturbo/](includ
 - `KVCacheManager` ([src/kv_cache.cpp](src/kv_cache.cpp)) -- owns the per-layer FP32 K/V buffers and the ring indexing (`physical_slot`) for **both** paths. `ForwardRunner` holds no KV buffers of its own.
 - `Tokenizer` ([src/tokenizer.cpp](src/tokenizer.cpp)) -- HF `tokenizer.json` BPE with byte fallback, Gemma 4 `<|turn>`/`<turn|>` markers (NOT Gemma 2/3 `<start_of_turn>`). A default-constructed `Tokenizer` holds no vocabulary and throws on `encode`.
 - Format layer: `GTurboManifestV1` ([src/manifest.cpp](src/manifest.cpp)), `PackedExpertsLayoutV1` ([src/packed_experts.cpp](src/packed_experts.cpp)), `ResidentIndexCodec` ([src/resident_index.cpp](src/resident_index.cpp)), constants in [include/gturbo/format.hpp](include/gturbo/format.hpp).
-- `HTTPServer` ([src/server.cpp](src/server.cpp)) and the `extern "C"` ABI in [src/c_api.cpp](src/c_api.cpp) (header [include/gturbo/c_api.h](include/gturbo/c_api.h)) -- the stable boundary `run_gui.py` binds to.
+- `HTTPServer` ([src/server.cpp](src/server.cpp)) and the `extern "C"` ABI in [src/c_api.cpp](src/c_api.cpp) (header [include/gturbo/c_api.h](include/gturbo/c_api.h)) -- the stable embedding boundary exported from `libturbo_engine.dll`.
+- `ModelFetcher` ([src/model_fetch.cpp](src/model_fetch.cpp)) -- runs `tools/convert_hf_to_gturbo.py` as a child process so a bundle can be built from the GUI, and probes the host for Python, the converter script and free disk.
 
 ### HLSL kernels ([shaders/](shaders/))
 
@@ -293,6 +341,9 @@ reference; in progress, roughly in this order:
 | Streaming token output (engine + CLI) | **done** -- `generate_tokens` + `StreamCallback`; SSE still to come |
 | Multi-turn engine entry point | **done** -- `generate_chat`; front-ends do not send history yet |
 | Thought-channel suppression -- the generation prompt opens a `thought` channel and nothing parses it | not started |
+| GUI exposure of stop sequences / `seed` / `repetition_penalty` | **done** -- Sampling & Determinism panel; `ServerConfig` stores all three |
+| GUI exposure of per-response usage, TTFT and true stop reason | **done** -- `stream_options.include_usage` plus the `x_turbo` chunk extension |
+| In-app model download | **done** -- `/api/download*` drives the converter; see `ModelFetcher` |
 | KV reuse across turns (prompt cache) -- every request re-prefills from scratch | not started |
 | OpenAI-compatible server (`/v1/chat/completions`, `/v1/models`, `/health`, SSE) | **done** -- [src/openai_api.cpp](src/openai_api.cpp) |
 | Real HTTP framing (Content-Length, chunked, 1 MiB limit, 413/415) | **done** -- [src/http.cpp](src/http.cpp) |
@@ -632,6 +683,25 @@ Two consequences worth keeping:
   runner. The release-first ordering exists so two models are never committed at once
   (2 x 12.9 GB at 128 slots), but without the up-front validation a mistyped path destroyed a
   perfectly good loaded model.
+
+## The server is loopback-only, and why
+
+`HTTPServer` binds `127.0.0.1` unless `--host 0.0.0.0` is passed. It has no authentication, sends
+`Access-Control-Allow-Origin: *`, and exposes endpoints that load models and start multi-GB
+downloads, so the default had to be the safe one.
+
+It previously bound `INADDR_ANY` unconditionally, and the static file handler concatenated the
+request target straight into `fs::path("gui" + path)` with nothing inspecting it. That combination
+was a verified arbitrary file read from any machine that could reach the port:
+
+```
+GET /../../../../../Windows/win.ini   ->  200, file contents
+```
+
+`request_path_is_safe()` ([src/server.cpp](src/server.cpp)) now rejects any target whose decoded
+form contains a `..` component, a backslash, a colon or a NUL, **before** dispatch -- so the guard
+covers the `/api` and `/v1` routes too, not just static files. It percent-decodes first, because
+`%2e%2e%2f` reaches the same place without a literal `..`. `tests/test_server.cpp` pins both forms.
 
 ## Published documentation
 

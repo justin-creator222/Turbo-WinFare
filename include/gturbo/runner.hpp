@@ -193,6 +193,7 @@ public:
     double expert_cache_hit_rate() const;
     std::string model_dir() const { return model_dir_; }
     const GTurboManifestV1& manifest() const { return manifest_; }
+    const PackedExpertsLayoutV1& layout() const { return layout_; }
     const Tokenizer& tokenizer() const { return tokenizer_; }
 
     uint64_t get_tensor_offset(const std::string& name) const {

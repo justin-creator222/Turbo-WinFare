@@ -7,6 +7,12 @@
 #include <set>
 #include <vector>
 
+// Set by CMake (add_compile_definitions in CMakeLists.txt). Defined here as well so the
+// header stays usable in a translation unit built outside this project's build system.
+#ifndef GTURBO_VERSION_STRING
+#define GTURBO_VERSION_STRING "0.0.0-dev"
+#endif
+
 namespace gturbo {
 
 enum class DType : uint8_t {

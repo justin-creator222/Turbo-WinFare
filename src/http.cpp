@@ -10,6 +10,64 @@
 
 namespace gturbo {
 
+// Percent-decodes a request target so the traversal check below cannot be sidestepped by
+// encoding the dots or the separator. Malformed escapes are left as literal characters --
+// this is a validator, not a router, and anything it cannot decode it must not wave through.
+std::string percent_decode(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    auto hex = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < in.size(); ++i) {
+        if (in[i] == '%' && i + 2 < in.size()) {
+            const int hi = hex(in[i + 1]);
+            const int lo = hex(in[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(in[i]);
+    }
+    return out;
+}
+
+// True when a request target is safe to act on.
+//
+// The static file handler builds fs::path("gui" + path) directly from this string, and
+// nothing validated it: `GET /../../../../../Windows/win.ini` returned that file with a 200,
+// on a server that also answered from every interface with no authentication. The rule is
+// deliberately strict -- a path component that is exactly ".." is rejected, as is a NUL, a
+// backslash (a separator on Windows, so "..\\.." traverses just as well as "../.."), and a
+// drive-qualified absolute path.
+bool request_path_is_safe(const std::string& raw) {
+    if (raw.empty() || raw[0] != '/') return false;
+
+    const std::string path = percent_decode(raw);
+
+    if (path.find('\0') != std::string::npos) return false;
+    if (path.find('\\') != std::string::npos) return false;
+    // "/C:/..." after decoding would escape the document root entirely.
+    if (path.find(':') != std::string::npos) return false;
+
+    size_t start = 0;
+    while (start <= path.size()) {
+        const size_t slash = path.find('/', start);
+        const std::string part =
+            path.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
+        if (part == "..") return false;
+        if (slash == std::string::npos) break;
+        start = slash + 1;
+    }
+    return true;
+}
+
+
 namespace {
 
 std::string lower(std::string_view s) {

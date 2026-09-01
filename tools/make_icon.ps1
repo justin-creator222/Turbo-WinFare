@@ -5,7 +5,10 @@
 #
 #   powershell -ExecutionPolicy Bypass -File tools/make_icon.ps1
 #
-# Note the source file gui/logo.png is really a JPEG (it starts with the JFIF magic), which
+# Source is docs/assets/logo.png. It used to be read from gui/, where it was a
+# byte-identical duplicate that nothing in the GUI referenced -- 575 KB copied into
+# build/gui on every build for no one.
+# Note the file is really a JPEG (it starts with the JFIF magic), which
 # is why this decodes through System.Drawing rather than a PNG reader.
 #
 # Two things the artwork forces on us:
@@ -25,7 +28,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 
 $repo = Split-Path -Parent $PSScriptRoot
-$src  = Join-Path $repo 'gui\logo.png'
+$src  = Join-Path $repo 'docsssets\logo.png'
 $out  = Join-Path $repo 'assets\turbo-winfare.ico'
 
 # Measured bounding box of the squircle border within the 1024x1024 artwork, and the corner

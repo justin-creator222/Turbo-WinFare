@@ -3,7 +3,9 @@
 #include "gturbo/runner.hpp"
 #include "gturbo/openai_api.hpp"
 #include "gturbo/http.hpp"
+#include "gturbo/model_fetch.hpp"
 #include <string>
+#include <vector>
 #include <memory>
 #include <atomic>
 #include <mutex>
@@ -18,6 +20,12 @@ struct ServerConfig {
     float top_p{0.95f};
     int top_k{64};
     int max_tokens{512};
+    // Engine features that had no home here, so /api/config could not persist them as
+    // defaults and the GUI had no way to set them at all.
+    float repetition_penalty{1.0f};
+    bool has_seed{false};
+    uint64_t seed{0};
+    std::vector<std::string> stop_strings;
     // Applied immediately.
     EvictionPolicy eviction_policy{EvictionPolicy::LFU};
     // Require re-initialization; stored so the GUI can show what a reload would use.
@@ -31,6 +39,13 @@ public:
     ~HTTPServer();
 
     void start(uint16_t port, std::shared_ptr<ForwardRunner> runner, std::shared_ptr<D3D12Context> ctx = nullptr);
+
+    // Interface to bind. Defaults to loopback: this server has no authentication and sends
+    // Access-Control-Allow-Origin: *, and it can load models and (with the download
+    // endpoints) start multi-GB transfers, none of which belongs on a LAN by default.
+    // `--host 0.0.0.0` opts in explicitly.
+    void set_bind_address(const std::string& host) { bind_address_ = host; }
+    std::string bind_address() const { return bind_address_; }
     void stop();
     bool is_running() const { return is_running_; }
 
@@ -43,6 +58,15 @@ public:
     // Reason the model failed to load, surfaced through /api/telemetry so the GUI can
     // explain why it shows NO MODEL instead of leaving the user guessing.
     void set_load_error(const std::string& message);
+    // Returns a COPY under runner_mutex_. The telemetry handler used to read load_error_
+    // directly, which raced with set_load_error() and swap_runner() -- the one member on
+    // this object that was written under the lock and read without it.
+    std::string load_error() const;
+
+    // Read-only startup configuration, for GET /api/server_info. These are fixed when the
+    // process launches; the GUI shows them so a user can see the port, bind address, model
+    // id and queue limit their server is actually running with.
+    void set_startup_info(uint16_t port, const std::string& host, bool serve_mode);
 
     void set_openai_config(const OpenAIServerConfig& cfg);
     // By value: the reload path rewrites max_context, so handing out a reference would let
@@ -56,6 +80,19 @@ public:
 
 private:
     void listen_loop(uint16_t port);
+    std::string bind_address_{"127.0.0.1"};
+    uint16_t startup_port_{8080};
+    bool serve_mode_{false};
+
+    // Drives tools/convert_hf_to_gturbo.py for the in-GUI model download. At most one runs
+    // at a time; the endpoints answer 409 rather than starting a second 14.6 GB transfer.
+    ModelFetcher fetcher_;
+    // probe_host_environment() spawns `python --version`, so it is cached rather than run on
+    // every /api/server_info poll.
+    mutable std::mutex env_mutex_;
+    mutable bool env_probed_{false};
+    mutable HostEnvironment host_env_;
+    const HostEnvironment& host_environment() const;
     void handle_client(uintptr_t client_socket);
 
     // OpenAI-compatible endpoints. Return true when the path was theirs.

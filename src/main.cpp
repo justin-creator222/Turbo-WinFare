@@ -12,6 +12,8 @@
 #include <string>
 #include <memory>
 #include <filesystem>
+#include <cmath>
+#include <limits>
 #include <windows.h>
 #include <shellapi.h>
 
@@ -106,6 +108,8 @@ static void print_usage() {
         "                       [alias: --expert-cache-slots]\n"
         "  --dump-tensors <dir> Write per-stage FP32 tensors for the first token (--cpu only)\n"
         "  --port <n>           HTTP port (default 8080)\n"
+        "  --host <addr>        Bind address: 127.0.0.1 (default), or 0.0.0.0 to\n"
+        "                       accept connections from other machines\n"
         "  --serve              Start the server without opening a browser\n"
         "  --model-id <name>    Model name the OpenAI endpoints expect\n"
         "  --queue-limit <n>    Requests allowed to wait for the engine (default 4)\n"
@@ -141,6 +145,9 @@ int main(int argc, char* argv[]) {
     size_t expert_slots = 0;   // 0 = auto-size from RAM
     int max_context = 0;       // 0 = auto-size from RAM
     uint16_t gui_port = 8080;
+    // Loopback unless explicitly widened. The server has no authentication and can load
+    // models, so binding every interface is an opt-in, not the default.
+    std::string bind_host = "127.0.0.1";
     bool auto_open_browser = true;
 
     // A flag that needs a value but is last on the line used to fall through silently, as did
@@ -151,8 +158,10 @@ int main(int argc, char* argv[]) {
         return false;
     };
 
-    // Non-numeric text used to escape the parse loop as an unhandled std::invalid_argument,
-    // which terminates the process instead of printing a usage error.
+    // Every numeric flag goes through one of these three. The parse loop sits outside the
+    // try that wraps the rest of main(), so a raw std::stoi/stof/stoull on bad input escaped
+    // as an unhandled std::invalid_argument and terminated the process instead of printing a
+    // usage error. They also reject trailing characters, which stoi silently accepts.
     auto parse_int = [](const std::string& flag, const char* text, int lo, int hi,
                         int& out) -> bool {
         try {
@@ -170,6 +179,47 @@ int main(int argc, char* argv[]) {
         } catch (const std::exception&) {
             std::cerr << "Error: " << flag << " expects an integer, got '" << text << "'"
                       << std::endl;
+            return false;
+        }
+    };
+
+    auto parse_float = [](const std::string& flag, const char* text, float lo, float hi,
+                          float& out) -> bool {
+        try {
+            const std::string value(text);
+            size_t consumed = 0;
+            const float parsed = std::stof(value, &consumed);
+            if (consumed != value.size()) throw std::invalid_argument("trailing characters");
+            if (!std::isfinite(parsed) || parsed < lo || parsed > hi) {
+                std::cerr << "Error: " << flag << " must be between " << lo << " and " << hi
+                          << " (got " << text << ")" << std::endl;
+                return false;
+            }
+            out = parsed;
+            return true;
+        } catch (const std::exception&) {
+            std::cerr << "Error: " << flag << " expects a number, got '" << text << "'"
+                      << std::endl;
+            return false;
+        }
+    };
+
+    auto parse_u64 = [](const std::string& flag, const char* text, uint64_t& out) -> bool {
+        try {
+            const std::string value(text);
+            // stoull happily wraps a negative literal into a huge positive one, so reject
+            // the sign before parsing rather than after.
+            if (!value.empty() && (value[0] == '-' || value[0] == '+')) {
+                throw std::invalid_argument("signed");
+            }
+            size_t consumed = 0;
+            const unsigned long long parsed = std::stoull(value, &consumed);
+            if (consumed != value.size()) throw std::invalid_argument("trailing characters");
+            out = static_cast<uint64_t>(parsed);
+            return true;
+        } catch (const std::exception&) {
+            std::cerr << "Error: " << flag << " expects a non-negative integer, got '"
+                      << text << "'" << std::endl;
             return false;
         }
     };
@@ -227,30 +277,37 @@ int main(int argc, char* argv[]) {
             expert_slots = static_cast<size_t>(slots_arg);
         } else if (arg == "--max-tokens" || arg == "--max-new") {
             if (!need_value(arg, i)) return 2;
-            max_tokens = std::stoi(argv[++i]);
-            if (max_tokens <= 0) {
-                std::cerr << "Error: --max-tokens must be greater than 0\n";
+            if (!parse_int(arg, argv[++i], 1, std::numeric_limits<int>::max(), max_tokens)) {
                 return 2;
             }
         } else if (arg == "--temperature") {
             if (!need_value(arg, i)) return 2;
-            temperature = std::stof(argv[++i]);
-            if (temperature < 0.0f) {
-                std::cerr << "Error: --temperature must be >= 0 (0 = greedy)\n";
-                return 2;
-            }
+            // 0 = greedy. The engine only requires finite and >= 0; the upper bound here
+            // matches what /v1/chat/completions accepts so both front-ends agree.
+            if (!parse_float(arg, argv[++i], 0.0f, 2.0f, temperature)) return 2;
         } else if (arg == "--top-p") {
             if (!need_value(arg, i)) return 2;
-            top_p = std::stof(argv[++i]);
+            if (!parse_float(arg, argv[++i], 0.0f, 1.0f, top_p)) return 2;
+            if (top_p <= 0.0f) {
+                std::cerr << "Error: --top-p must be greater than 0\n";
+                return 2;
+            }
         } else if (arg == "--top-k") {
             if (!need_value(arg, i)) return 2;
-            top_k = std::stoi(argv[++i]);
+            // 0 disables. The ceiling is kMaxTopK in src/sampling.cpp -- the shortlist
+            // optimization depends on that bound, so it is not a soft limit.
+            if (!parse_int(arg, argv[++i], 0, 256, top_k)) return 2;
         } else if (arg == "--repetition-penalty") {
             if (!need_value(arg, i)) return 2;
-            repetition_penalty = std::stof(argv[++i]);
+            if (!parse_float(arg, argv[++i], 0.0f, 1000.0f, repetition_penalty)) return 2;
+            if (repetition_penalty <= 0.0f) {
+                std::cerr << "Error: --repetition-penalty must be greater than 0"
+                             " (1 disables it)\n";
+                return 2;
+            }
         } else if (arg == "--seed") {
             if (!need_value(arg, i)) return 2;
-            seed = std::stoull(argv[++i]);
+            if (!parse_u64(arg, argv[++i], seed)) return 2;
             has_seed = true;
         } else if (arg == "--stop") {
             if (!need_value(arg, i)) return 2;
@@ -259,7 +316,11 @@ int main(int argc, char* argv[]) {
             quiet = true;
         } else if (arg == "--port") {
             if (!need_value(arg, i)) return 2;
-            gui_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+            // A static_cast<uint16_t> on the raw stoi silently truncated: --port 65537
+            // became port 1, and --port abc terminated the process.
+            int port_arg = 0;
+            if (!parse_int(arg, argv[++i], 1, 65535, port_arg)) return 2;
+            gui_port = static_cast<uint16_t>(port_arg);
         } else if (arg == "--serve") {
             // Headless: same server, no browser. This is how the OpenAI endpoints are meant
             // to be run.
@@ -270,11 +331,17 @@ int main(int argc, char* argv[]) {
             openai_cfg.model_id = argv[++i];
         } else if (arg == "--queue-limit") {
             if (!need_value(arg, i)) return 2;
-            openai_cfg.queue_limit = std::stoi(argv[++i]);
-            if (openai_cfg.queue_limit < 0) {
-                std::cerr << "Error: --queue-limit must be >= 0\n";
+            if (!parse_int(arg, argv[++i], 0, 4096, openai_cfg.queue_limit)) return 2;
+        } else if (arg == "--host") {
+            if (!need_value(arg, i)) return 2;
+            bind_host = argv[++i];
+            if (bind_host != "127.0.0.1" && bind_host != "0.0.0.0" &&
+                bind_host != "localhost") {
+                std::cerr << "Error: --host accepts 127.0.0.1 (default), localhost, or "
+                             "0.0.0.0\n";
                 return 2;
             }
+            if (bind_host == "localhost") bind_host = "127.0.0.1";
         } else if (arg == "--no-open") {
             auto_open_browser = false;
         } else {
@@ -415,6 +482,8 @@ int main(int argc, char* argv[]) {
             // Model silently dropped back to RAM auto-sizing, because ServerConfig starts at
             // the 0 = auto sentinel and the reload path reads it verbatim.
             server->set_initial_engine_config(max_context, static_cast<int>(expert_slots));
+            server->set_bind_address(bind_host);
+            server->set_startup_info(gui_port, bind_host, !auto_open_browser);
             server->start(gui_port, runner, ctx);
 
             std::cout << "      OpenAI-compatible API at http://127.0.0.1:" << gui_port

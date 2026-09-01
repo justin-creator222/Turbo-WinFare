@@ -17,6 +17,21 @@
 
 namespace gturbo {
 
+// True when a request target is safe to act on.
+//
+// The static file handler builds a filesystem path directly from the request target, and
+// nothing used to validate it: `GET /../../../../../Windows/win.ini` returned that file with
+// a 200, on a server that also answered from every interface with no authentication. This
+// runs before dispatch, so it guards the /api and /v1 routes as well.
+//
+// Percent-decoded first: `%2e%2e%2f` reaches the same place without a literal "..".
+bool request_path_is_safe(const std::string& raw);
+
+// Percent-decodes a request target. Malformed escapes are left as literal characters -- this
+// feeds a validator, so anything undecodable must not be waved through.
+std::string percent_decode(const std::string& in);
+
+
 struct HttpRequest {
     std::string method;
     std::string path;

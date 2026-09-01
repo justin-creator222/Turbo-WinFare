@@ -31,12 +31,18 @@ Everything lives in the `gturbo::` namespace, with headers under [include/gturbo
 | Detokenizer | [src/detokenizer.cpp](../src/detokenizer.cpp) | Streaming detokenization and `StreamingStopMatcher` for string stop sequences. |
 | Format layer | [src/manifest.cpp](../src/manifest.cpp), [src/packed_experts.cpp](../src/packed_experts.cpp), [src/resident_index.cpp](../src/resident_index.cpp) | `GTurboManifestV1`, `PackedExpertsLayoutV1`, `ResidentIndexCodec`. Constants in [include/gturbo/format.hpp](../include/gturbo/format.hpp). |
 | HTTP + API | [src/http.cpp](../src/http.cpp), [src/server.cpp](../src/server.cpp), [src/openai_api.cpp](../src/openai_api.cpp) | Request framing (Content-Length, chunked, 1 MiB limit, 413/415), the GUI server, and the OpenAI-compatible endpoints. |
-| C ABI | [src/c_api.cpp](../src/c_api.cpp), [include/gturbo/c_api.h](../include/gturbo/c_api.h) | The stable `extern "C"` boundary `run_gui.py` binds to with `ctypes`. |
+| C ABI | [src/c_api.cpp](../src/c_api.cpp), [include/gturbo/c_api.h](../include/gturbo/c_api.h) | The stable `extern "C"` embedding boundary, exported from `libturbo_engine.dll`. |
+| Model fetch | [src/model_fetch.cpp](../src/model_fetch.cpp) | Drives `tools/convert_hf_to_gturbo.py` as a child process for the in-GUI download, and probes the host for Python, the converter and free disk. |
 | CPU reference | [src/cpu_reference.cpp](../src/cpu_reference.cpp) | Scalar FP32 forward pass. Touches no D3D12. Ground truth for the GPU path. |
 
-Two front-ends exist. `turbo-winfare.exe` is canonical. `run_gui.py` is a convenience
-`http.server` that loads `libturbo_engine.dll` through the C API; it is **not** at parity with
-the native server and does not push its configuration into the engine.
+`turbo-winfare.exe` is the only front-end. A Python `http.server` bridge (`run_gui.py`) used to
+sit beside it; it was removed because it implemented neither `/v1/*` nor `GET /api/config`, which
+the browser GUI requires, so generation under it never worked at all. The C ABI it bound to is
+unaffected and still ships in `libturbo_engine.dll`.
+
+The server binds `127.0.0.1` by default. It has no authentication, sends
+`Access-Control-Allow-Origin: *`, and can load models and start multi-GB downloads, so exposing it
+on a network is an explicit opt-in via `--host 0.0.0.0`.
 
 ## The per-layer dispatch graph
 
