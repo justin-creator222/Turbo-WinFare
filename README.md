@@ -48,6 +48,20 @@ device, and none of them need the 13.3 GB model bundle.
 
 ---
 
+## Sibling project — Turbo-WinFare Dense
+
+[**Turbo-WinFare Dense**](https://github.com/justin-creator222/Turbo-WinFare-Dense) applies the
+same idea to a *dense* model instead of a mixture of experts. It is a **Vulkan 1.3** engine that
+runs **Gemma 4 31B Dense** on the same class of hardware (Legion Go S, Radeon 780M). Where this
+repository streams the eight experts each layer routes to, Dense keeps 45 of the model's 60
+layers resident and reads the other 15 from NVMe on every token — about 4 GB per token — and it
+uses Gemma 4 E2B as a speculative draft model. Measured at **1.08–1.13 tok/s** greedy decode at
+4096 context; E2B on its own is fully resident and runs at ~15 tok/s.
+
+Separate codebase, separate container format (`.g4dense`), separate GUI and OpenAI-compatible
+server. The two projects share the design brief — an APU whose driver will not hand out as much
+memory as the model needs — not code.
+
 ## Requirements
 
 | | |
